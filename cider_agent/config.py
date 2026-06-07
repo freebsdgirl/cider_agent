@@ -1,0 +1,167 @@
+"""Configuration loading for cider_agent."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .errors import CiderConfigError
+
+
+CONFIG_ENV_VAR = "CIDER_AGENT_CONFIG_PATH"
+
+
+def _env_path(name: str) -> Path | None:
+    value = os.getenv(name)
+    if not value:
+        return None
+    return Path(value).expanduser()
+
+
+def _xdg_config_home() -> Path:
+    return _env_path("XDG_CONFIG_HOME") or (Path.home() / ".config")
+
+
+def _default_config_paths() -> list[Path]:
+    paths: list[Path] = []
+    explicit = _env_path(CONFIG_ENV_VAR)
+    if explicit is not None:
+        paths.append(explicit)
+    paths.append(Path.cwd() / "config.json")
+    paths.append(_xdg_config_home() / "cider-agent" / "config.json")
+    return paths
+
+
+def _load_json_config() -> tuple[dict[str, Any], Path | None]:
+    for path in _default_config_paths():
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CiderConfigError(f"Could not parse config file {path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise CiderConfigError(f"Config file {path} must contain a JSON object.")
+        return payload, path
+    return {}, None
+
+
+def _config_or_env(config: dict[str, Any], env_name: str, key: str, default: Any = None) -> Any:
+    if env_name in os.environ:
+        return os.environ[env_name]
+    return config.get(key, default)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    raise CiderConfigError(f"Could not interpret boolean value: {value!r}")
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Runtime settings for cider_agent."""
+
+    http_host: str = "127.0.0.1"
+    http_port: int = 8766
+    public_base_url: str = "http://127.0.0.1:8766"
+    cider_base_url: str = "http://localhost:10767"
+    cider_api_token: str | None = None
+    default_search_source: str = "catalog"
+    request_timeout_seconds: float = 10.0
+    verify_tls: bool = True
+    log_level: str = "INFO"
+    database_path: Path = Path("~/.local/share/cider-agent/cider-agent.db").expanduser()
+    config_path: Path | None = None
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        config, config_path = _load_json_config()
+
+        http_host = str(_config_or_env(config, "CIDER_AGENT_HTTP_HOST", "http_host", "127.0.0.1")).strip()
+        http_port = int(_config_or_env(config, "CIDER_AGENT_HTTP_PORT", "http_port", 8766))
+        public_base_url = str(
+            _config_or_env(config, "CIDER_AGENT_PUBLIC_BASE_URL", "public_base_url", f"http://{http_host}:{http_port}")
+        ).strip().rstrip("/")
+        cider_base_url = str(
+            _config_or_env(config, "CIDER_AGENT_CIDER_BASE_URL", "cider_base_url", "http://localhost:10767")
+        ).strip().rstrip("/")
+        cider_api_token_raw = _config_or_env(config, "CIDER_AGENT_CIDER_API_TOKEN", "cider_api_token")
+        default_search_source = str(
+            _config_or_env(config, "CIDER_AGENT_DEFAULT_SEARCH_SOURCE", "default_search_source", "catalog")
+        ).strip().lower()
+        request_timeout_seconds = float(
+            _config_or_env(config, "CIDER_AGENT_REQUEST_TIMEOUT_SECONDS", "request_timeout_seconds", 10.0)
+        )
+        verify_tls = _as_bool(_config_or_env(config, "CIDER_AGENT_VERIFY_TLS", "verify_tls", True))
+        log_level = str(_config_or_env(config, "CIDER_AGENT_LOG_LEVEL", "log_level", "INFO")).strip().upper()
+        database_path = Path(
+            str(
+                _config_or_env(
+                    config,
+                    "CIDER_AGENT_DATABASE_PATH",
+                    "database_path",
+                    "~/.local/share/cider-agent/cider-agent.db",
+                )
+            )
+        ).expanduser()
+
+        cider_api_token = str(cider_api_token_raw).strip() if cider_api_token_raw is not None else None
+
+        if not http_host:
+            raise CiderConfigError("http_host cannot be empty.")
+        if http_port <= 0 or http_port > 65535:
+            raise CiderConfigError("http_port must be between 1 and 65535.")
+        if not public_base_url:
+            raise CiderConfigError("public_base_url cannot be empty.")
+        if not cider_base_url:
+            raise CiderConfigError("cider_base_url cannot be empty.")
+        if default_search_source not in {"catalog", "library"}:
+            raise CiderConfigError("default_search_source must be either 'catalog' or 'library'.")
+        if request_timeout_seconds <= 0:
+            raise CiderConfigError("request_timeout_seconds must be positive.")
+        if log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
+            raise CiderConfigError("log_level must be one of CRITICAL, ERROR, WARNING, INFO, DEBUG.")
+
+        return cls(
+            http_host=http_host,
+            http_port=http_port,
+            public_base_url=public_base_url,
+            cider_base_url=cider_base_url,
+            cider_api_token=cider_api_token,
+            default_search_source=default_search_source,
+            request_timeout_seconds=request_timeout_seconds,
+            verify_tls=verify_tls,
+            log_level=log_level,
+            database_path=database_path,
+            config_path=config_path,
+        )
+
+    def ensure_storage_parent(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def sanitized(self) -> dict[str, Any]:
+        return {
+            "http_host": self.http_host,
+            "http_port": self.http_port,
+            "public_base_url": self.public_base_url,
+            "cider_base_url": self.cider_base_url,
+            "has_cider_api_token": bool(self.cider_api_token),
+            "default_search_source": self.default_search_source,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "verify_tls": self.verify_tls,
+            "log_level": self.log_level,
+            "database_path": str(self.database_path),
+            "config_path": str(self.config_path) if self.config_path else None,
+        }

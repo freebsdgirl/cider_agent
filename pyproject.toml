@@ -1,0 +1,30 @@
+[project]
+name = "cider-agent"
+version = "0.1.0"
+description = "A2A-capable audio control agent for the Cider Apple Music client."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+cider-agent = "cider_agent.cli:main"
+cider-agent-serve = "cider_agent.a2a:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cider_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
