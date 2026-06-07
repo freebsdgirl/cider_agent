@@ -214,6 +214,8 @@ def _execute_message(message: dict[str, Any], *, task_id: str | None = None, con
     if resolved is not None:
         task["metadata"]["resolver"] = resolved["resolver"]
         task["metadata"]["resolved_action"] = resolved["resolved_action"]
+        if "reasoning" in resolved:
+            task["metadata"]["reasoning"] = resolved["reasoning"]
     TASK_STORE.save(task)
     return task
 

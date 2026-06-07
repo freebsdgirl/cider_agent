@@ -83,6 +83,7 @@ class Settings:
     resolver_base_url: str = "https://api.openai.com/v1"
     resolver_model: str | None = None
     resolver_api_key: str | None = None
+    resolver_include_reasoning: bool = False
     request_timeout_seconds: float = 60.0
     verify_tls: bool = True
     log_level: str = "INFO"
@@ -113,6 +114,14 @@ class Settings:
         ).strip().rstrip("/")
         resolver_model_raw = _config_or_env(config, "CIDER_AGENT_RESOLVER_MODEL", "resolver_model")
         resolver_api_key_raw = _config_or_env(config, "CIDER_AGENT_RESOLVER_API_KEY", "resolver_api_key")
+        resolver_include_reasoning = _as_bool(
+            _config_or_env(
+                config,
+                "CIDER_AGENT_RESOLVER_INCLUDE_REASONING",
+                "resolver_include_reasoning",
+                False,
+            )
+        )
         request_timeout_seconds = float(
             _config_or_env(config, "CIDER_AGENT_REQUEST_TIMEOUT_SECONDS", "request_timeout_seconds", 60.0)
         )
@@ -165,6 +174,7 @@ class Settings:
             resolver_base_url=resolver_base_url,
             resolver_model=resolver_model,
             resolver_api_key=resolver_api_key,
+            resolver_include_reasoning=resolver_include_reasoning,
             request_timeout_seconds=request_timeout_seconds,
             verify_tls=verify_tls,
             log_level=log_level,
@@ -187,6 +197,7 @@ class Settings:
             "resolver_base_url": self.resolver_base_url,
             "resolver_model": self.resolver_model,
             "has_resolver_api_key": bool(self.resolver_api_key),
+            "resolver_include_reasoning": self.resolver_include_reasoning,
             "request_timeout_seconds": self.request_timeout_seconds,
             "verify_tls": self.verify_tls,
             "log_level": self.log_level,

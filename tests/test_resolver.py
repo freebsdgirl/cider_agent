@@ -46,6 +46,7 @@ def test_openai_compatible_resolver_parses_action(settings: Settings, service) -
         resolver_base_url="https://resolver.example/v1",
         resolver_model="gpt-test",
         resolver_api_key="secret",
+        resolver_include_reasoning=False,
         request_timeout_seconds=settings.request_timeout_seconds,
         verify_tls=settings.verify_tls,
         log_level=settings.log_level,
@@ -73,6 +74,7 @@ def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Setti
         resolver_base_url="https://resolver.example/v1",
         resolver_model="gpt-test",
         resolver_api_key="secret",
+        resolver_include_reasoning=False,
         request_timeout_seconds=settings.request_timeout_seconds,
         verify_tls=settings.verify_tls,
         log_level=settings.log_level,
@@ -104,3 +106,45 @@ def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Setti
     resolved = resolver.resolve("play some pink", service)
 
     assert resolved.parameters["query"] == "Pink"
+
+
+def test_openai_compatible_resolver_includes_reasoning_when_enabled(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=True,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class ReasoningTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"action": "status", "parameters": {}}),
+                            "reasoning": "I mapped the request to a simple status action.",
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=ReasoningTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("play some kep1er", service)
+
+    assert resolved.reasoning == "I mapped the request to a simple status action."

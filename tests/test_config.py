@@ -9,13 +9,14 @@ def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps(
-            {
-                "http_port": 9900,
-                "cider_api_token": "from-config",
-                "default_search_source": "library",
-                "database_path": str(tmp_path / "db.sqlite3"),
-            }
-        ),
+                {
+                    "http_port": 9900,
+                    "cider_api_token": "from-config",
+                    "default_search_source": "library",
+                    "resolver_include_reasoning": True,
+                    "database_path": str(tmp_path / "db.sqlite3"),
+                }
+            ),
         encoding="utf-8",
     )
     monkeypatch.setenv("CIDER_AGENT_CONFIG_PATH", str(config_path))
@@ -25,4 +26,5 @@ def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
     assert settings.http_port == 9900
     assert settings.cider_api_token == "from-config"
     assert settings.default_search_source == "library"
+    assert settings.resolver_include_reasoning is True
     assert settings.database_path == tmp_path / "db.sqlite3"

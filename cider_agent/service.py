@@ -586,7 +586,7 @@ class CiderAgentService:
     def handle_text_request(self, text: str) -> dict[str, Any]:
         resolved = self.resolve_text_request(text)
         execution = self.run_action(resolved.action, resolved.parameters)
-        return {
+        response = {
             "status": "ok",
             "input": text,
             "resolver": resolved.resolver,
@@ -596,6 +596,9 @@ class CiderAgentService:
             },
             "execution": execution,
         }
+        if resolved.reasoning:
+            response["reasoning"] = resolved.reasoning
+        return response
 
     def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
         params = parameters or {}

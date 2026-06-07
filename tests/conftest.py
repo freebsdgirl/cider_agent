@@ -196,6 +196,7 @@ def settings(tmp_path: Path) -> Settings:
         resolver_base_url="https://api.openai.com/v1",
         resolver_model=None,
         resolver_api_key=None,
+        resolver_include_reasoning=False,
         request_timeout_seconds=10.0,
         verify_tls=True,
         log_level="INFO",

@@ -21,6 +21,7 @@ class ResolvedAction:
     parameters: dict[str, Any]
     resolver: str
     raw: dict[str, Any] | None = None
+    reasoning: str | None = None
 
 
 class Resolver(Protocol):
@@ -109,7 +110,13 @@ class OpenAICompatibleResolver:
         if not isinstance(parameters, dict):
             raise ResolverError("Resolver output parameters must be an object.")
         parameters = self._normalize_parameters(action, parameters)
-        return ResolvedAction(action=action, parameters=parameters, resolver="openai_compatible", raw=parsed)
+        return ResolvedAction(
+            action=action,
+            parameters=parameters,
+            resolver="openai_compatible",
+            raw=parsed,
+            reasoning=self._extract_reasoning(body),
+        )
 
     def _build_messages(self, text: str, service: Any) -> list[dict[str, str]]:
         playback = service.playback_snapshot()
@@ -184,6 +191,18 @@ class OpenAICompatibleResolver:
             text_parts = [part.get("text", "") for part in content if isinstance(part, dict)]
             return "\n".join(part for part in text_parts if part)
         raise ResolverError("Resolver response did not include text content.")
+
+    def _extract_reasoning(self, body: dict[str, Any]) -> str | None:
+        if not self._settings.resolver_include_reasoning:
+            return None
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return None
+        message = choices[0].get("message", {})
+        reasoning = message.get("reasoning")
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning.strip()
+        return None
 
     def _parse_json_object(self, content: str) -> dict[str, Any]:
         content = content.strip()
