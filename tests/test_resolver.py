@@ -63,6 +63,60 @@ def test_openai_compatible_resolver_parses_action(settings: Settings, service) -
     assert resolved.parameters["source"] == "default"
 
 
+def test_openai_compatible_resolver_sends_no_think_ollama_fields(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    captured: dict[str, object] = {}
+
+    class CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode("utf-8"))
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "status",
+                                    "parameters": {},
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=CaptureTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolver.resolve("play some kep1er", service)
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["think"] is False
+    assert body["reasoning_effort"] == "none"
+    assert body["reasoning"] == {"effort": "none"}
+
+
 def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
@@ -151,6 +205,52 @@ def test_openai_compatible_resolver_includes_reasoning_when_enabled(settings: Se
     resolved = resolver.resolve("play some kep1er", service)
 
     assert resolved.reasoning == "I mapped the request to a simple status action."
+
+
+def test_openai_compatible_resolver_includes_structured_reasoning_when_enabled(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=True,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class StructuredReasoningTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"action": "status", "parameters": {}}),
+                            "reasoning_content": [
+                                {"text": "First thought."},
+                                {"text": "Second thought."},
+                            ],
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=StructuredReasoningTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("play some kep1er", service)
+
+    assert resolved.reasoning == "First thought.\nSecond thought."
 
 
 def test_openai_compatible_resolver_can_reject_current_track(settings: Settings, service) -> None:
@@ -449,6 +549,60 @@ def test_session_plan_prefers_live_artist_selection_for_artist_request(settings:
     assert plan.candidate_tracks == []
     assert plan.candidate_artists[0] == "KATSEYE"
     assert plan.candidate_queries == ["KATSEYE"]
+
+
+def test_session_plan_caps_candidate_lists(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class CappedPlanTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "candidate_tracks": [
+                                        {"title": "One", "artist": "A"},
+                                        {"title": "Two", "artist": "B"},
+                                        {"title": "Three", "artist": "C"},
+                                    ],
+                                    "candidate_artists": ["Artist A", "Artist B"],
+                                    "candidate_queries": ["query one", "query two"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=CappedPlanTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    plan = resolver.plan_session("play cleaning music", service, {"request_text": "play cleaning music"}, 3)
+
+    assert plan.candidate_tracks == [{"title": "One", "artist": "A"}]
+    assert plan.candidate_artists == ["Artist A"]
+    assert plan.candidate_queries == ["query one"]
 
 
 def test_play_session_request_text_is_normalized_to_request(settings: Settings, service) -> None:

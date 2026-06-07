@@ -86,6 +86,45 @@ def test_handle_text_request_uses_resolver(service) -> None:
     assert isinstance(result["summary"], str)
 
 
+def test_handle_text_request_includes_timings_when_enabled(settings, service, tmp_path) -> None:
+    timed_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        include_timing_debug=True,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=settings.session_recent_tracks_limit,
+        global_recent_tracks_limit=settings.global_recent_tracks_limit,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "timed.db",
+        config_path=settings.config_path,
+    )
+    timed_service = CiderAgentService(
+        timed_settings,
+        rpc_client=service._rpc,
+        preference_store=PreferenceStore(timed_settings.database_path),
+        resolver=service._resolver,
+    )
+
+    result = timed_service.handle_text_request("play some kep1er")
+
+    assert "timings" in result
+    assert "resolve_ms" in result["timings"]
+    assert "execute_ms" in result["timings"]
+    assert "total_ms" in result["timings"]
+
+
 def test_handle_text_request_can_start_adaptive_session(service) -> None:
     result = service.handle_text_request("it's morning - play something upbeat and with energy")
 
@@ -97,6 +136,149 @@ def test_handle_text_request_can_start_adaptive_session(service) -> None:
     assert result["execution"]["result"]["result"]["enqueued_count"] == 0
     assert "primary_track" in result["execution"]["result"]["result"]
     assert result["summary"].startswith("playing ")
+
+
+def test_adaptive_session_timing_debug_includes_selection_breakdown(settings, service, tmp_path) -> None:
+    timed_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        include_timing_debug=True,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=settings.session_recent_tracks_limit,
+        global_recent_tracks_limit=settings.global_recent_tracks_limit,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "timed-session.db",
+        config_path=settings.config_path,
+    )
+    timed_service = CiderAgentService(
+        timed_settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(timed_settings.database_path),
+        resolver=service._resolver.__class__(),
+    )
+
+    result = timed_service.handle_text_request("it's morning - play something upbeat and with energy")
+
+    execution_timings = result["timings"]["execution"]
+    assert "playback_snapshot_ms" in execution_timings
+    assert "plan_session_ms" in execution_timings
+    assert "collect_tracks_ms" in execution_timings
+    assert "candidate_track_search_count" in execution_timings
+
+
+def test_collect_session_tracks_caps_search_work(settings, service, tmp_path) -> None:
+    class CountingRpcClient:
+        def __init__(self) -> None:
+            self.search_queries: list[str] = []
+
+        def close(self) -> None:
+            return None
+
+        def playback_get(self, path: str):
+            if path == "/now-playing":
+                return {"info": {}}
+            if path == "/queue":
+                return []
+            if path == "/is-playing":
+                return {"status": "ok", "is_playing": False}
+            if path == "/volume":
+                return {"volume": 0.5}
+            if path == "/repeat-mode":
+                return {"value": 0}
+            if path == "/shuffle-mode":
+                return {"value": 0}
+            if path == "/autoplay":
+                return {"value": False}
+            return {"value": True}
+
+        def playback_post(self, path: str, body=None):
+            return {"path": path, "body": body}
+
+        def search_catalog(self, query: str, *, limit: int, storefront: str):
+            self.search_queries.append(query)
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": f"id-{len(self.search_queries)}",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": "Picked",
+                                        "artistName": "Artist",
+                                        "albumName": "Album",
+                                        "playParams": {"id": f"id-{len(self.search_queries)}", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+
+    rpc = CountingRpcClient()
+    capped_service = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            include_timing_debug=True,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=tmp_path / "capped-search.db",
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(tmp_path / "capped-search.db"),
+        resolver=service._resolver,
+    )
+    session = {"id": 1, "request_text": "play cleaning music", "steering_history": []}
+    plan = type(
+        "Plan",
+        (),
+        {
+            "candidate_tracks": [
+                {"title": "One", "artist": "Artist A"},
+                {"title": "Two", "artist": "Artist B"},
+                {"title": "Three", "artist": "Artist C"},
+            ],
+            "candidate_artists": ["Artist X", "Artist Y"],
+            "candidate_queries": ["query one", "query two"],
+        },
+    )()
+
+    timings: dict[str, object] = {}
+    capped_service._collect_session_tracks(session, plan, limit=1, timings=timings)
+
+    assert timings["candidate_track_search_count"] == 1
+    assert timings["candidate_artist_search_count"] == 1
+    assert timings["candidate_query_search_count"] == 1
 
 
 def test_steer_session_updates_active_session(service) -> None:
@@ -165,6 +347,207 @@ def test_reject_current_track_advances_active_session_without_changing_vibe(serv
     assert result["status"] == "ok"
     assert result["result"]["selection_strategy"] == "adaptive-session-reject-current"
     assert result["result"]["tracks"][0]["title"] == "Another Song"
+
+
+def test_new_session_avoids_recent_global_starter_track(settings, service, tmp_path) -> None:
+    class RepeatingPlanResolver:
+        def __init__(self) -> None:
+            self.plan_calls = 0
+
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            self.plan_calls += 1
+            return type(
+                "Plan",
+                (),
+                {
+                    "candidate_tracks": [
+                        {"title": "Liked Song", "artist": "Favorite Artist"}
+                        if self.plan_calls == 1
+                        else {"title": "Another Song", "artist": "Favorite Artist"}
+                    ],
+                    "candidate_artists": [],
+                    "candidate_queries": [request],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+    repeat_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=5,
+        global_recent_tracks_limit=10,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "global-recent.db",
+        config_path=settings.config_path,
+    )
+    repeat_service = CiderAgentService(
+        repeat_settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(repeat_settings.database_path),
+        resolver=RepeatingPlanResolver(),
+    )
+
+    first = repeat_service.play_session("play upbeat music")
+    assert first["result"]["tracks"][0]["title"] == "Liked Song"
+
+    repeat_service.stop_session()
+
+    second = repeat_service.play_session("play upbeat music again")
+    assert second["result"]["tracks"][0]["title"] == "Another Song"
+
+
+def test_top_pool_order_randomizes_within_small_high_confidence_bucket(service) -> None:
+    class ReverseRandom:
+        def shuffle(self, items) -> None:
+            items.reverse()
+
+    service._random = ReverseRandom()
+    ordered = service._top_pool_order(
+        [
+            {"title": "One"},
+            {"title": "Two"},
+            {"title": "Three"},
+            {"title": "Four"},
+        ],
+        take=3,
+    )
+
+    assert [track["title"] for track in ordered] == ["Three", "Two", "One"]
+
+
+def test_session_planning_reuses_cached_playback_snapshot(settings, tmp_path) -> None:
+    class SnapshotCountingRpcClient:
+        def __init__(self) -> None:
+            self.playback_get_calls: list[str] = []
+
+        def close(self) -> None:
+            return None
+
+        def playback_get(self, path: str):
+            self.playback_get_calls.append(path)
+            if path == "/now-playing":
+                return {
+                    "info": {
+                        "name": "Track",
+                        "artistName": "Artist",
+                        "albumName": "Album",
+                        "playParams": {"id": "track-1", "kind": "songs", "isLibrary": False},
+                        "durationInMillis": 180000,
+                    }
+                }
+            if path == "/queue":
+                return []
+            if path == "/is-playing":
+                return {"status": "ok", "is_playing": True}
+            if path == "/volume":
+                return {"volume": 0.5}
+            if path == "/repeat-mode":
+                return {"value": 0}
+            if path == "/shuffle-mode":
+                return {"value": 0}
+            if path == "/autoplay":
+                return {"value": False}
+            return {"value": True}
+
+        def playback_post(self, path: str, body=None):
+            return {"path": path, "body": body}
+
+        def search_catalog(self, query: str, *, limit: int, storefront: str):
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": "catalog-track-1",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": "Liked Song",
+                                        "artistName": "Favorite Artist",
+                                        "albumName": "Album",
+                                        "playParams": {"id": "catalog-track-1", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+
+    class SnapshotAwareResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            playback = service.session_planning_playback_snapshot(session)
+            assert playback["track"]["title"] == "Track"
+            return type(
+                "Plan",
+                (),
+                {
+                    "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
+                    "candidate_artists": [],
+                    "candidate_queries": [request],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+    rpc = SnapshotCountingRpcClient()
+    snapshot_service = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=tmp_path / "snapshot-cache.db",
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(tmp_path / "snapshot-cache.db"),
+        resolver=SnapshotAwareResolver(),
+    )
+
+    snapshot_service.play_session("play upbeat music")
+
+    assert rpc.playback_get_calls.count("/is-playing") == 1
+    assert rpc.playback_get_calls.count("/now-playing") == 1
+    assert rpc.playback_get_calls.count("/queue") == 1
 
 
 def test_handle_text_request_includes_raw_output_when_enabled(settings, service, tmp_path) -> None:

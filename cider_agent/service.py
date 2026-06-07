@@ -6,6 +6,7 @@ from datetime import datetime
 import logging
 import uuid
 from dataclasses import dataclass
+import random
 import threading
 import time
 from typing import Any
@@ -20,6 +21,10 @@ from .storage import PreferenceStore
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000.0, 2)
 
 
 def _flatten_track_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -187,6 +192,10 @@ class CiderAgentService:
 
     SESSION_REFILL_INTERVAL_SECONDS = 5.0
     SESSION_ADVANCE_COOLDOWN_SECONDS = 5.0
+    TRACK_SELECTION_POOL_SIZE = 3
+    MAX_SESSION_TRACK_SEARCH_CANDIDATES = 1
+    MAX_SESSION_ARTIST_SEARCH_CANDIDATES = 1
+    MAX_SESSION_QUERY_SEARCH_CANDIDATES = 1
 
     def __init__(
         self,
@@ -208,6 +217,7 @@ class CiderAgentService:
         self._session_runtime_lock = threading.Lock()
         self._session_runtime: dict[int, dict[str, Any]] = {}
         self._session_advance_lock = threading.Lock()
+        self._random = random.SystemRandom()
 
     def close(self) -> None:
         self.stop_background_session_worker()
@@ -222,8 +232,14 @@ class CiderAgentService:
     def response_detail(self) -> str:
         return self._settings.response_detail
 
+    def include_timing_debug(self) -> bool:
+        return self._settings.include_timing_debug
+
     def session_recent_tracks_limit(self) -> int:
         return self._settings.session_recent_tracks_limit
+
+    def global_recent_tracks_limit(self) -> int:
+        return self._settings.global_recent_tracks_limit
 
     def current_timestamp(self) -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -718,6 +734,18 @@ class CiderAgentService:
             return []
         return self._preferences.list_session_tracks(session["id"], limit=limit or self.session_recent_tracks_limit())
 
+    def recent_global_tracks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        return self._preferences.list_recent_tracks(limit=limit or self.global_recent_tracks_limit())
+
+    def session_planning_playback_snapshot(self, session: dict[str, Any]) -> dict[str, Any]:
+        session_id = session.get("id")
+        if session_id is not None:
+            runtime = self._get_session_runtime(int(session_id))
+            cached = runtime.get("planning_playback_snapshot")
+            if isinstance(cached, dict):
+                return dict(cached)
+        return self.playback_snapshot()
+
     def stop_session(self) -> dict[str, Any]:
         stopped = self._preferences.stop_active_session()
         if stopped is not None:
@@ -827,7 +855,7 @@ class CiderAgentService:
             query_text = str(query).strip()
             if not query_text:
                 continue
-            result = self.play_search_result(query=query_text, source="default", index=0, storefront=storefront)
+            result = self._play_search_result_from_pool(query=query_text, source="default", storefront=storefront)
             return {
                 "status": "ok",
                 "selection_strategy": "candidate_query_fallback",
@@ -841,7 +869,10 @@ class CiderAgentService:
         return self._resolver.resolve(text, self)
 
     def handle_text_request(self, text: str) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        resolve_started_at = time.perf_counter()
         resolved = self.resolve_text_request(text)
+        resolve_ms = _elapsed_ms(resolve_started_at)
         response = {
             "status": "ok",
             "input": text,
@@ -854,6 +885,7 @@ class CiderAgentService:
             response["resolver_raw_content"] = resolved.raw_content
         if resolved.raw is not None and self._settings.resolver_include_raw_output:
             response["resolver_raw_action"] = resolved.raw
+        execute_started_at = time.perf_counter()
         try:
             execution = self.run_action(resolved.action, resolved.parameters)
         except CiderAgentError as exc:
@@ -862,9 +894,25 @@ class CiderAgentService:
                 "type": exc.__class__.__name__,
                 "message": str(exc),
             }
+            if self.include_timing_debug():
+                response["timings"] = {
+                    "resolve_ms": resolve_ms,
+                    "execute_ms": _elapsed_ms(execute_started_at),
+                    "total_ms": _elapsed_ms(started_at),
+                }
             raise TextRequestExecutionError(str(exc), response) from exc
         response["execution"] = execution
         response["summary"] = self._summarize_execution(execution)
+        if self.include_timing_debug():
+            timings = {
+                "resolve_ms": resolve_ms,
+                "execute_ms": _elapsed_ms(execute_started_at),
+                "total_ms": _elapsed_ms(started_at),
+            }
+            execution_timings = self._extract_execution_timings(execution)
+            if isinstance(execution_timings, dict):
+                timings["execution"] = execution_timings
+            response["timings"] = timings
         return response
 
     def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1017,6 +1065,8 @@ class CiderAgentService:
 
     def _play_session_track(self, session: dict[str, Any], *, selection_strategy: str) -> dict[str, Any]:
         with self._session_advance_lock:
+            total_started_at = time.perf_counter()
+            timings: dict[str, Any] = {}
             now = time.monotonic()
             self._set_session_runtime(
                 session["id"],
@@ -1025,24 +1075,40 @@ class CiderAgentService:
                 last_advance_at=now,
             )
             try:
+                playback_started_at = time.perf_counter()
                 playback = self.playback_snapshot()
+                timings["playback_snapshot_ms"] = _elapsed_ms(playback_started_at)
+                self._set_session_runtime(session["id"], planning_playback_snapshot=playback)
+                record_current_started_at = time.perf_counter()
                 self._record_current_track_for_session(session, playback=playback)
-                plan = self._plan_session_tracks(session, count=3)
-                tracks = self._collect_session_tracks(plan, limit=3)
+                timings["record_current_track_ms"] = _elapsed_ms(record_current_started_at)
+                planning_started_at = time.perf_counter()
+                plan = self._plan_session_tracks(session, count=1)
+                timings["plan_session_ms"] = _elapsed_ms(planning_started_at)
+                collect_started_at = time.perf_counter()
+                tracks = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                timings["collect_tracks_ms"] = _elapsed_ms(collect_started_at)
                 if not tracks:
                     raise CiderValidationError("No playable candidate match could be resolved.")
                 lead_track = tracks[0]
+                play_started_at = time.perf_counter()
                 playback_result = self._play_flattened_track(lead_track, is_library_default=False)
+                timings["play_track_ms"] = _elapsed_ms(play_started_at)
+                record_selected_started_at = time.perf_counter()
                 self._preferences.add_session_track(session["id"], lead_track)
+                timings["record_selected_track_ms"] = _elapsed_ms(record_selected_started_at)
+                touch_started_at = time.perf_counter()
                 self._preferences.touch_session_refill(session["id"])
+                timings["touch_session_ms"] = _elapsed_ms(touch_started_at)
                 self._set_session_runtime(
                     session["id"],
                     suspended=False,
                     advance_in_progress=False,
                     last_advance_at=time.monotonic(),
                     last_selected_track_id=_clean_id(lead_track.get("play_params", {}).get("id")),
+                    planning_playback_snapshot=None,
                 )
-                return {
+                result = {
                     "status": "ok",
                     "selection_strategy": selection_strategy,
                     "playback": playback_result,
@@ -1054,8 +1120,12 @@ class CiderAgentService:
                         "candidate_queries": plan.candidate_queries,
                     },
                 }
+                if self.include_timing_debug():
+                    timings["total_ms"] = _elapsed_ms(total_started_at)
+                    result["timings"] = timings
+                return result
             except Exception:
-                self._set_session_runtime(session["id"], advance_in_progress=False)
+                self._set_session_runtime(session["id"], advance_in_progress=False, planning_playback_snapshot=None)
                 raise
 
     def _plan_session_tracks(self, session: dict[str, Any], *, count: int) -> SessionPlan:
@@ -1074,19 +1144,35 @@ class CiderAgentService:
             return str(session.get("request_text", "")).strip()
         return f"{session.get('request_text', '').strip()} Current steering: {steering_text}".strip()
 
-    def _collect_session_tracks(self, plan: SessionPlan, *, limit: int) -> list[dict[str, Any]]:
-        excluded_ids = self._session_excluded_track_ids()
+    def _collect_session_tracks(
+        self,
+        session: dict[str, Any],
+        plan: SessionPlan,
+        *,
+        limit: int,
+        timings: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        excluded_ids = self._session_excluded_track_ids(session)
         chosen: list[dict[str, Any]] = []
         seen_ids = set(excluded_ids)
+        track_search_count = 0
+        track_search_ms = 0.0
+        artist_search_count = 0
+        artist_search_ms = 0.0
+        query_search_count = 0
+        query_search_ms = 0.0
 
-        for candidate in plan.candidate_tracks:
+        for candidate in plan.candidate_tracks[: self.MAX_SESSION_TRACK_SEARCH_CANDIDATES]:
             if len(chosen) >= limit:
                 break
             title = str(candidate.get("title", "")).strip()
             artist = str(candidate.get("artist", "")).strip()
             if not title or not artist:
                 continue
+            search_started_at = time.perf_counter()
             search = self.search_catalog_tracks(f"{artist} {title}", limit=10)
+            track_search_ms += _elapsed_ms(search_started_at)
+            track_search_count += 1
             match = self._best_track_match(search["tracks"], title=title, artist=artist)
             if match is None:
                 continue
@@ -1097,10 +1183,13 @@ class CiderAgentService:
             if match_id:
                 seen_ids.add(match_id)
 
-        for artist in plan.candidate_artists:
+        for artist in plan.candidate_artists[: self.MAX_SESSION_ARTIST_SEARCH_CANDIDATES]:
             if len(chosen) >= limit:
                 break
+            search_started_at = time.perf_counter()
             search = self.search_catalog_tracks(str(artist), limit=15)
+            artist_search_ms += _elapsed_ms(search_started_at)
+            artist_search_count += 1
             for match in self._best_artist_track_matches(search["tracks"], artist=str(artist), limit=limit - len(chosen)):
                 match_id = str(match.get("id", "")).strip()
                 if match_id and match_id in seen_ids:
@@ -1111,11 +1200,14 @@ class CiderAgentService:
                 if len(chosen) >= limit:
                     break
 
-        for query in plan.candidate_queries:
+        for query in plan.candidate_queries[: self.MAX_SESSION_QUERY_SEARCH_CANDIDATES]:
             if len(chosen) >= limit:
                 break
+            search_started_at = time.perf_counter()
             results = self.search(str(query), limit=25)
-            for track in results.get("tracks", []):
+            query_search_ms += _elapsed_ms(search_started_at)
+            query_search_count += 1
+            for track in self._top_pool_order(list(results.get("tracks", [])), take=limit - len(chosen)):
                 match_id = str(track.get("id", "")).strip()
                 if match_id and match_id in seen_ids:
                     continue
@@ -1125,15 +1217,30 @@ class CiderAgentService:
                 if len(chosen) >= limit:
                     break
 
+        if timings is not None and self.include_timing_debug():
+            timings["candidate_track_search_count"] = track_search_count
+            timings["candidate_track_search_ms"] = round(track_search_ms, 2)
+            timings["candidate_artist_search_count"] = artist_search_count
+            timings["candidate_artist_search_ms"] = round(artist_search_ms, 2)
+            timings["candidate_query_search_count"] = query_search_count
+            timings["candidate_query_search_ms"] = round(query_search_ms, 2)
+            timings["excluded_track_count"] = len(excluded_ids)
+            timings["selected_track_count"] = len(chosen)
+
         return chosen
 
-    def _session_excluded_track_ids(self) -> set[str]:
+    def _session_excluded_track_ids(self, session: dict[str, Any]) -> set[str]:
         excluded: set[str] = set()
-        current = self.get_now_playing().get("track", {})
-        current_id = _clean_id(current.get("play_params", {}).get("id"))
+        playback = self.session_planning_playback_snapshot(session)
+        current = playback.get("track", {})
+        current_id = _clean_id(current.get("track_id"))
         if current_id:
             excluded.add(current_id)
         for track in self.recent_session_tracks(limit=self.session_recent_tracks_limit()):
+            track_id = _clean_id(track.get("track_id"))
+            if track_id:
+                excluded.add(track_id)
+        for track in self.recent_global_tracks(limit=self.global_recent_tracks_limit()):
             track_id = _clean_id(track.get("track_id"))
             if track_id:
                 excluded.add(track_id)
@@ -1273,7 +1380,7 @@ class CiderAgentService:
         if not exact_artist_tracks:
             return []
         scored = sorted(exact_artist_tracks, key=self._artist_track_score, reverse=True)
-        return scored[:limit]
+        return self._top_pool_order(scored, take=limit)
 
     def _artist_track_score(self, track: dict[str, Any]) -> tuple[int, int]:
         album = _normalize_match_text(track.get("album"))
@@ -1291,6 +1398,37 @@ class CiderAgentService:
         if title == "pink" or title == "pink!":
             title_penalty -= 3
         return (album_score, title_penalty)
+
+    def _top_pool_order(
+        self,
+        tracks: list[dict[str, Any]],
+        *,
+        take: int,
+        pool_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if take <= 0 or not tracks:
+            return []
+        bounded_pool = max(1, min(pool_size or self.TRACK_SELECTION_POOL_SIZE, len(tracks)))
+        top_pool = list(tracks[:bounded_pool])
+        self._random.shuffle(top_pool)
+        ordered = top_pool + list(tracks[bounded_pool:])
+        return ordered[:take]
+
+    def _play_search_result_from_pool(self, *, query: str, source: str, storefront: str) -> dict[str, Any]:
+        resolved_source = source.strip().lower()
+        if resolved_source == "default":
+            resolved_source = self.default_search_source()
+        if resolved_source not in {"catalog", "library"}:
+            raise CiderValidationError("source must be one of: default, catalog, library.")
+        if resolved_source == "catalog":
+            results = self.search_catalog_tracks(query, limit=10, storefront=storefront)
+        else:
+            results = self.search_library_tracks(query, limit=10)
+        tracks = results["tracks"]
+        if not tracks:
+            raise CiderValidationError(f"No tracks found for query: {query}")
+        selected = self._top_pool_order(tracks, take=1)[0]
+        return self._play_flattened_track(selected, is_library_default=resolved_source == "library")
 
     def _play_flattened_track(self, track: dict[str, Any], *, is_library_default: bool) -> dict[str, Any]:
         play_params = track.get("play_params", {})
@@ -1473,7 +1611,22 @@ class CiderAgentService:
         tracks = value.get("tracks")
         if isinstance(tracks, list) and tracks:
             compact["primary_track"] = self._compact_track(tracks[0]) if isinstance(tracks[0], dict) else tracks[0]
+        if self.include_timing_debug() and isinstance(value.get("timings"), dict):
+            compact["timings"] = value["timings"]
         return compact
+
+    def _extract_execution_timings(self, execution: dict[str, Any]) -> dict[str, Any] | None:
+        result = execution.get("result")
+        if isinstance(result, dict):
+            timings = result.get("timings")
+            if isinstance(timings, dict):
+                return timings
+            nested = result.get("result")
+            if isinstance(nested, dict):
+                nested_timings = nested.get("timings")
+                if isinstance(nested_timings, dict):
+                    return nested_timings
+        return None
 
     def _compact_session_status(self, value: dict[str, Any]) -> dict[str, Any]:
         compact: dict[str, Any] = {

@@ -6,15 +6,12 @@ from cider_agent import cli
 from cider_agent.errors import TextRequestExecutionError
 
 
-def test_call_local_a2a_waits_for_submitted_task(monkeypatch, settings) -> None:
+def test_call_local_a2a_forces_non_deferred_server_execution(monkeypatch, settings) -> None:
     calls: list[tuple[str, dict[str, object]]] = []
-    responses = [
-        {
-            "kind": "task",
-            "id": "task-1",
-            "status": {"state": "submitted"},
-        },
-        {
+
+    def fake_post_local_a2a(*, method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        return {
             "kind": "task",
             "id": "task-1",
             "status": {"state": "completed"},
@@ -24,16 +21,11 @@ def test_call_local_a2a_waits_for_submitted_task(monkeypatch, settings) -> None:
                     "parts": [{"kind": "data", "data": {"status": "ok"}}],
                 }
             ],
-        },
-    ]
-
-    def fake_post_local_a2a(*, method: str, params: dict[str, object]) -> dict[str, object]:
-        calls.append((method, params))
-        return responses.pop(0)
+            "metadata": {"reasoning": "thinking thoughts"},
+        }
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "_post_local_a2a", fake_post_local_a2a)
-    monkeypatch.setattr(cli.time, "sleep", lambda _: None)
 
     task = cli._call_local_a2a(
         {
@@ -45,20 +37,26 @@ def test_call_local_a2a_waits_for_submitted_task(monkeypatch, settings) -> None:
     )
 
     assert task["status"]["state"] == "completed"
+    assert task["metadata"]["reasoning"] == "thinking thoughts"
     assert calls == [
-        ("message/send", {"message": {"kind": "message", "messageId": "m-1", "role": "user", "parts": [{"kind": "data", "data": {"action": "pause", "parameters": {}}}]}}),
-        ("tasks/get", {"id": "task-1"}),
+        (
+            "message/send",
+            {
+                "message": {
+                    "kind": "message",
+                    "messageId": "m-1",
+                    "role": "user",
+                    "parts": [{"kind": "data", "data": {"action": "pause", "parameters": {}}}],
+                },
+                "defer": False,
+            },
+        ),
     ]
 
 
-def test_call_local_a2a_raises_for_failed_submitted_task(monkeypatch, settings) -> None:
-    responses = [
-        {
-            "kind": "task",
-            "id": "task-2",
-            "status": {"state": "submitted"},
-        },
-        {
+def test_call_local_a2a_raises_for_failed_task(monkeypatch, settings) -> None:
+    def fake_post_local_a2a(*, method: str, params: dict[str, object]) -> dict[str, object]:
+        return {
             "kind": "task",
             "id": "task-2",
             "status": {
@@ -72,15 +70,10 @@ def test_call_local_a2a_raises_for_failed_submitted_task(monkeypatch, settings) 
                 },
             },
             "artifacts": [],
-        },
-    ]
-
-    def fake_post_local_a2a(*, method: str, params: dict[str, object]) -> dict[str, object]:
-        return responses.pop(0)
+        }
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "_post_local_a2a", fake_post_local_a2a)
-    monkeypatch.setattr(cli.time, "sleep", lambda _: None)
 
     with pytest.raises(TextRequestExecutionError, match="No active session is running."):
         cli._call_local_a2a(

@@ -90,6 +90,18 @@ def test_should_defer_message_for_mutating_structured_action() -> None:
     assert a2a._should_defer_message(message) is True
 
 
+def test_resolve_defer_mode_allows_explicit_override() -> None:
+    message = {
+        "kind": "message",
+        "messageId": "m-5b",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "play upbeat morning music"}],
+    }
+
+    assert a2a._resolve_defer_mode(message, {"defer": False}) is False
+    assert a2a._resolve_defer_mode(message, {"defer": True}) is True
+
+
 def test_complete_submitted_task_updates_state() -> None:
     request = {
         "kind": "message",

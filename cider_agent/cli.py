@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 import uuid
 from typing import Any
 
@@ -14,9 +13,6 @@ import httpx
 from .a2a import _message
 from .app import get_service, get_settings
 from .errors import CiderAgentError, TextRequestExecutionError
-
-
-TERMINAL_TASK_STATES = {"completed", "failed", "cancelled", "rejected"}
 
 
 def _print_payload(payload: dict[str, Any], as_json: bool) -> None:
@@ -99,29 +95,10 @@ def _raise_for_failed_task(task: dict[str, Any]) -> None:
     raise CiderAgentError(message)
 
 
-def _wait_for_task_completion(task: dict[str, Any]) -> dict[str, Any]:
-    settings = get_settings()
-    task_id = str(task.get("id", "")).strip()
-    if not task_id:
-        raise CiderAgentError("Local A2A server returned a submitted task without an id.")
-    deadline = time.monotonic() + float(settings.request_timeout_seconds)
-    while time.monotonic() < deadline:
-        current = _post_local_a2a(method="tasks/get", params={"id": task_id})
-        state = str(current.get("status", {}).get("state", "")).strip().lower()
-        if state == "completed":
-            return current
-        if state in TERMINAL_TASK_STATES:
-            _raise_for_failed_task(current)
-        time.sleep(0.1)
-    raise CiderAgentError(f"Local A2A server task {task_id} did not complete within {settings.request_timeout_seconds:g}s.")
-
-
 def _call_local_a2a(message: dict[str, Any]) -> dict[str, Any]:
-    task = _post_local_a2a(method="message/send", params={"message": message})
+    task = _post_local_a2a(method="message/send", params={"message": message, "defer": False})
     state = str(task.get("status", {}).get("state", "")).strip().lower()
-    if state == "submitted":
-        return _wait_for_task_completion(task)
-    if state in TERMINAL_TASK_STATES and state != "completed":
+    if state != "completed":
         _raise_for_failed_task(task)
     return task
 

@@ -184,6 +184,13 @@ def _should_defer_message(message: dict[str, Any]) -> bool:
     return False
 
 
+def _resolve_defer_mode(message: dict[str, Any], params: dict[str, Any]) -> bool:
+    explicit = params.get("defer")
+    if isinstance(explicit, bool):
+        return explicit
+    return _should_defer_message(message)
+
+
 def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
     parts = message.get("parts", [])
     for part in parts:
@@ -390,7 +397,7 @@ def create_a2a_app() -> FastAPI:
                     raise CiderValidationError("message/send requires params.message.")
                 resolved_task_id = str(params.get("taskId") or uuid.uuid4())
                 resolved_context_id = str(message.get("contextId") or params.get("contextId") or uuid.uuid4())
-                if _should_defer_message(message):
+                if _resolve_defer_mode(message, params):
                     task = _submitted_task(
                         task_id=resolved_task_id,
                         context_id=resolved_context_id,
@@ -417,7 +424,7 @@ def create_a2a_app() -> FastAPI:
                     raise CiderValidationError("message/stream requires params.message.")
                 resolved_task_id = str(params.get("taskId") or uuid.uuid4())
                 resolved_context_id = str(message.get("contextId") or params.get("contextId") or uuid.uuid4())
-                deferred = _should_defer_message(message)
+                deferred = _resolve_defer_mode(message, params)
                 if deferred:
                     task = _submitted_task(
                         task_id=resolved_task_id,

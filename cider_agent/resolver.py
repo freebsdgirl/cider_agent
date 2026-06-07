@@ -83,6 +83,10 @@ class FallbackResolver:
 class OpenAICompatibleResolver:
     """Resolve text requests using an OpenAI-compatible chat completions endpoint."""
 
+    MAX_SESSION_CANDIDATE_TRACKS = 1
+    MAX_SESSION_CANDIDATE_ARTISTS = 1
+    MAX_SESSION_CANDIDATE_QUERIES = 1
+
     def __init__(self, settings: Settings, session: httpx.Client | None = None) -> None:
         self._settings = settings
         self._session = session or httpx.Client(
@@ -129,12 +133,12 @@ class OpenAICompatibleResolver:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
         body, content = self._complete_json(self._build_session_messages(request, service, session, count), headers)
         parsed = self._parse_json_object(content)
-        candidate_tracks = self._normalize_candidate_tracks(parsed.get("candidate_tracks"))
-        candidate_artists = self._normalize_candidate_artists(parsed.get("candidate_artists"))
-        candidate_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))
+        candidate_tracks = self._normalize_candidate_tracks(parsed.get("candidate_tracks"))[: self.MAX_SESSION_CANDIDATE_TRACKS]
+        candidate_artists = self._normalize_candidate_artists(parsed.get("candidate_artists"))[: self.MAX_SESSION_CANDIDATE_ARTISTS]
+        candidate_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))[: self.MAX_SESSION_CANDIDATE_QUERIES]
         artist_seed = self._extract_artist_seed(request)
         if artist_seed and artist_seed not in candidate_artists:
-            candidate_artists = [artist_seed, *candidate_artists]
+            candidate_artists = [artist_seed, *candidate_artists][: self.MAX_SESSION_CANDIDATE_ARTISTS]
         if artist_seed and not self._request_mentions_specific_track(request):
             candidate_tracks = []
         if artist_seed and not candidate_queries:
@@ -143,6 +147,7 @@ class OpenAICompatibleResolver:
             synthesized = self._fallback_query_from_text(request)
             if synthesized:
                 candidate_queries = [synthesized]
+        candidate_queries = candidate_queries[: self.MAX_SESSION_CANDIDATE_QUERIES]
         return SessionPlan(
             candidate_tracks=candidate_tracks,
             candidate_artists=candidate_artists,
@@ -244,7 +249,8 @@ class OpenAICompatibleResolver:
             "session_request": session.get("request_text"),
             "session_steering": session.get("steering_history", [])[-5:],
             "recent_tracks": service.recent_session_tracks(limit=service.session_recent_tracks_limit()),
-            "playback_summary": service.playback_snapshot(),
+            "global_recent_tracks": service.recent_global_tracks(limit=service.global_recent_tracks_limit()),
+            "playback_summary": service.session_planning_playback_snapshot(session),
             "preferences": service.list_preferences()["preferences"][:5],
             "count": count,
         }
@@ -253,7 +259,10 @@ class OpenAICompatibleResolver:
             "Return only JSON with keys candidate_tracks, candidate_artists, and candidate_queries. "
             "candidate_tracks must be a list of objects shaped like {\"title\": string, \"artist\": string}. "
             "Use real, attributable music. Do not invent fake artist or track names. "
-            "Avoid repeating tracks from recent_tracks unless truly necessary. "
+            f"The session needs {count} next track candidate right now. "
+            "Keep the plan small and decisive: return at most 1 candidate_tracks entry, at most 1 candidate_artist, and exactly 1 candidate_queries fallback phrase. "
+            "Do not brainstorm large option lists or narrate multiple revisions before deciding. "
+            "Avoid repeating tracks from recent_tracks or global_recent_tracks unless truly necessary. "
             "Honor the original session_request, steering changes, and the current timestamp. "
             "If the request is generic, you may adapt to time of day, such as higher energy in the morning and calmer music late at night. "
             "If the request names an artist but not a specific song, prefer candidate_artists and let the service retrieve live catalog tracks rather than guessing exact songs from memory. "
@@ -268,6 +277,9 @@ class OpenAICompatibleResolver:
         payload = {
             "model": self._settings.resolver_model,
             "messages": messages,
+            "think": False,
+            "reasoning_effort": "none",
+            "reasoning": {"effort": "none"},
         }
         try:
             response = self._session.post("/chat/completions", headers=headers, json=payload)
@@ -307,9 +319,41 @@ class OpenAICompatibleResolver:
         if not isinstance(choices, list) or not choices:
             return None
         message = choices[0].get("message", {})
-        reasoning = message.get("reasoning")
-        if isinstance(reasoning, str) and reasoning.strip():
-            return reasoning.strip()
+        for key in ("reasoning", "reasoning_content", "thinking"):
+            extracted = self._extract_text_block(message.get(key))
+            if extracted:
+                return extracted
+        return None
+
+    def _extract_text_block(self, value: Any) -> str | None:
+        if isinstance(value, str):
+            trimmed = value.strip()
+            return trimmed or None
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    trimmed = item.strip()
+                    if trimmed:
+                        parts.append(trimmed)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                for key in ("text", "content", "reasoning", "thinking"):
+                    nested = item.get(key)
+                    if isinstance(nested, str):
+                        trimmed = nested.strip()
+                        if trimmed:
+                            parts.append(trimmed)
+                            break
+            if parts:
+                return "\n".join(parts)
+        if isinstance(value, dict):
+            for key in ("text", "content", "reasoning", "thinking"):
+                nested = value.get(key)
+                extracted = self._extract_text_block(nested)
+                if extracted:
+                    return extracted
         return None
 
     def _extract_raw_content(self, content: str) -> str | None:

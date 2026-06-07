@@ -85,8 +85,10 @@ class Settings:
     resolver_api_key: str | None = None
     resolver_include_reasoning: bool = False
     resolver_include_raw_output: bool = False
+    include_timing_debug: bool = False
     response_detail: str = "compact"
     session_recent_tracks_limit: int = 20
+    global_recent_tracks_limit: int = 50
     request_timeout_seconds: float = 60.0
     verify_tls: bool = True
     log_level: str = "INFO"
@@ -133,6 +135,14 @@ class Settings:
                 False,
             )
         )
+        include_timing_debug = _as_bool(
+            _config_or_env(
+                config,
+                "CIDER_AGENT_INCLUDE_TIMING_DEBUG",
+                "include_timing_debug",
+                False,
+            )
+        )
         response_detail = str(
             _config_or_env(
                 config,
@@ -147,6 +157,14 @@ class Settings:
                 "CIDER_AGENT_SESSION_RECENT_TRACKS_LIMIT",
                 "session_recent_tracks_limit",
                 20,
+            )
+        )
+        global_recent_tracks_limit = int(
+            _config_or_env(
+                config,
+                "CIDER_AGENT_GLOBAL_RECENT_TRACKS_LIMIT",
+                "global_recent_tracks_limit",
+                50,
             )
         )
         request_timeout_seconds = float(
@@ -189,6 +207,8 @@ class Settings:
             raise CiderConfigError("response_detail must be either 'compact' or 'debug'.")
         if session_recent_tracks_limit <= 0 or session_recent_tracks_limit > 200:
             raise CiderConfigError("session_recent_tracks_limit must be between 1 and 200.")
+        if global_recent_tracks_limit <= 0 or global_recent_tracks_limit > 500:
+            raise CiderConfigError("global_recent_tracks_limit must be between 1 and 500.")
         if request_timeout_seconds <= 0:
             raise CiderConfigError("request_timeout_seconds must be positive.")
         if log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
@@ -207,8 +227,10 @@ class Settings:
             resolver_api_key=resolver_api_key,
             resolver_include_reasoning=resolver_include_reasoning,
             resolver_include_raw_output=resolver_include_raw_output,
+            include_timing_debug=include_timing_debug,
             response_detail=response_detail,
             session_recent_tracks_limit=session_recent_tracks_limit,
+            global_recent_tracks_limit=global_recent_tracks_limit,
             request_timeout_seconds=request_timeout_seconds,
             verify_tls=verify_tls,
             log_level=log_level,
@@ -233,8 +255,10 @@ class Settings:
             "has_resolver_api_key": bool(self.resolver_api_key),
             "resolver_include_reasoning": self.resolver_include_reasoning,
             "resolver_include_raw_output": self.resolver_include_raw_output,
+            "include_timing_debug": self.include_timing_debug,
             "response_detail": self.response_detail,
             "session_recent_tracks_limit": self.session_recent_tracks_limit,
+            "global_recent_tracks_limit": self.global_recent_tracks_limit,
             "request_timeout_seconds": self.request_timeout_seconds,
             "verify_tls": self.verify_tls,
             "log_level": self.log_level,

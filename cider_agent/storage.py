@@ -305,6 +305,35 @@ class PreferenceStore:
             )
         return tracks
 
+    def list_recent_tracks(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT track_id, title, artist, album, href, recorded_at, session_id
+                FROM session_tracks
+                ORDER BY recorded_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        tracks: list[dict[str, Any]] = []
+        for row in rows:
+            track_id = str(row["track_id"]).strip() if row["track_id"] is not None else ""
+            if not track_id or track_id.lower() == "none":
+                continue
+            tracks.append(
+                {
+                    "session_id": int(row["session_id"]),
+                    "track_id": track_id,
+                    "title": row["title"],
+                    "artist": row["artist"],
+                    "album": row["album"],
+                    "href": row["href"],
+                    "recorded_at": row["recorded_at"],
+                }
+            )
+        return tracks
+
     def _decode_session_row(self, row: sqlite3.Row) -> dict[str, Any]:
         try:
             steering_history = json.loads(row["steering_history_json"])

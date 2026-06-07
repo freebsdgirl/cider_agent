@@ -184,8 +184,10 @@ Common structured actions:
 - Mid-session steering requests such as "more pop" or "more of this artist" update the active session and refill the queue against that new direction.
 - `resolver_include_reasoning` is a debug-only option. When enabled, `cider_agent` will include model-provided reasoning text in output if the resolver backend returns it.
 - `resolver_include_raw_output` is another debug-only option. When enabled, `cider_agent` will include the resolver's exact raw `message.content` string as `resolver_raw_content`, plus the parsed JSON object as `resolver_raw_action`.
+- `include_timing_debug` is another debug-only option. When enabled, `cider_agent` will attach timing breakdowns to text requests and adaptive session execution so you can see whether latency is coming from resolver calls, Cider RPC state snapshots, catalog lookups, or playback actions.
 - `response_detail` defaults to `compact`, which trims tool-facing execution results down to compact summaries instead of returning full raw Apple Music and Cider payloads. Set it to `debug` during development if you want the larger result objects back.
 - `session_recent_tracks_limit` controls how many previously played session tracks are provided back to the resolver to discourage repeats. The default is `20`.
+- `global_recent_tracks_limit` controls how many recently played tracks across all sessions are fed back into adaptive planning and exclusion logic to reduce repetitive starter picks across separate play requests. The default is `50`.
 - The default request timeout is 60 seconds to accommodate slower local models and Cider RPC calls.
 - Live verification against a current Cider build showed `/api/v1/amapi/run-v3` behaves as a read-only `path` passthrough. Playlist creation and add-track mutation are therefore not exposed in this version of `cider_agent`.
 - The web UI is intentionally not part of v1, but the service layer is transport-agnostic so a future local UI can reuse the same operations.
