@@ -17,4 +17,6 @@ def get_settings() -> Settings:
 
 @lru_cache(maxsize=1)
 def get_service() -> CiderAgentService:
-    return CiderAgentService(get_settings())
+    service = CiderAgentService(get_settings())
+    service.start_background_session_worker()
+    return service

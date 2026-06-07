@@ -85,6 +85,32 @@ def test_handle_text_request_uses_resolver(service) -> None:
     assert result["execution"]["action"] == "search"
 
 
+def test_handle_text_request_can_start_adaptive_session(service) -> None:
+    result = service.handle_text_request("it's morning - play something upbeat and with energy")
+
+    assert result["resolved_action"]["action"] == "play_session"
+    assert result["execution"]["action"] == "play_session"
+    assert result["execution"]["result"]["mode"] == "adaptive-session"
+
+
+def test_steer_session_updates_active_session(service) -> None:
+    service.play_session("play upbeat music")
+
+    result = service.steer_session("more pop")
+
+    assert result["session"]["steering_history"][-1] == "more pop"
+    assert result["result"]["selection_strategy"] == "adaptive-session-refill"
+
+
+def test_session_status_includes_recent_tracks(service) -> None:
+    service.play_session("play upbeat music")
+
+    status = service.session_status()
+
+    assert status["session"] is not None
+    assert isinstance(status["recent_tracks"], list)
+
+
 def test_handle_text_request_includes_raw_output_when_enabled(settings, service, tmp_path) -> None:
     class RawStubResolver:
         def resolve(self, text: str, service) -> ResolvedAction:

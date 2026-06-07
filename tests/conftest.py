@@ -206,7 +206,26 @@ class StubResolver:
                 },
                 resolver="stub",
             )
+        if "upbeat" in normalized or "morning" in normalized:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+        if "more pop" in normalized:
+            return ResolvedAction(action="steer_session", parameters={"request": text}, resolver="stub")
         return ResolvedAction(action="status", parameters={}, resolver="stub")
+
+    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int):
+        return type(
+            "Plan",
+            (),
+            {
+                "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
+                "candidate_artists": ["Favorite Artist"],
+                "candidate_queries": [request],
+                "resolver": "stub",
+                "raw": None,
+                "reasoning": None,
+                "raw_content": None,
+            },
+        )()
 
 
 @pytest.fixture

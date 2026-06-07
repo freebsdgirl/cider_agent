@@ -69,6 +69,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ask = subparsers.add_parser("ask")
     ask.add_argument("text")
 
+    session = subparsers.add_parser("session")
+    session_subparsers = session.add_subparsers(dest="session_command", required=True)
+    session_subparsers.add_parser("status")
+    session_subparsers.add_parser("stop")
+    session_subparsers.add_parser("refill")
+
     playlist = subparsers.add_parser("playlist")
     playlist_subparsers = playlist.add_subparsers(dest="playlist_command", required=True)
     playlist_subparsers.add_parser("list")
@@ -181,6 +187,13 @@ def main() -> None:
                 payload = service.search_catalog(args.query, limit=args.limit, storefront=args.storefront)
         elif args.command == "ask":
             payload = service.handle_text_request(args.text)
+        elif args.command == "session":
+            if args.session_command == "status":
+                payload = service.session_status()
+            elif args.session_command == "stop":
+                payload = service.stop_session()
+            else:
+                payload = service.refill_active_session()
         elif args.command == "playlist":
             if args.playlist_command == "list":
                 payload = service.list_library_playlists()

@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+import logging
 import uuid
 from dataclasses import dataclass
+import threading
+import time
 from typing import Any
 from urllib.parse import quote
 import re
 
 from .config import Settings
 from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
-from .resolver import ResolvedAction, Resolver, build_resolver
+from .resolver import ResolvedAction, Resolver, SessionPlan, build_resolver
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _flatten_track_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -89,6 +96,13 @@ def _normalize_match_text(value: str | None) -> str:
     normalized = normalized.replace("p!nk", "pink")
     normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
     return " ".join(normalized.split())
+
+
+def _clean_id(value: Any) -> str:
+    if value is None:
+        return ""
+    cleaned = str(value).strip()
+    return "" if cleaned.lower() == "none" else cleaned
 
 
 @dataclass
@@ -171,6 +185,10 @@ class DeterministicRecommender:
 class CiderAgentService:
     """High-level operations for the Cider agent."""
 
+    SESSION_QUEUE_TARGET_SIZE = 4
+    SESSION_QUEUE_REFILL_THRESHOLD = 2
+    SESSION_REFILL_INTERVAL_SECONDS = 15.0
+
     def __init__(
         self,
         settings: Settings,
@@ -185,8 +203,12 @@ class CiderAgentService:
         self._preferences = preference_store or PreferenceStore(settings.database_path)
         self._recommender = recommender or DeterministicRecommender()
         self._resolver = resolver or build_resolver(settings)
+        self._session_worker_thread: threading.Thread | None = None
+        self._session_worker_stop = threading.Event()
+        self._session_worker_lock = threading.Lock()
 
     def close(self) -> None:
+        self.stop_background_session_worker()
         self._rpc.close()
         close = getattr(self._resolver, "close", None)
         if callable(close):
@@ -194,6 +216,32 @@ class CiderAgentService:
 
     def default_search_source(self) -> str:
         return self._settings.default_search_source
+
+    def session_recent_tracks_limit(self) -> int:
+        return self._settings.session_recent_tracks_limit
+
+    def current_timestamp(self) -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def start_background_session_worker(self) -> None:
+        with self._session_worker_lock:
+            if self._session_worker_thread is not None and self._session_worker_thread.is_alive():
+                return
+            self._session_worker_stop.clear()
+            self._session_worker_thread = threading.Thread(
+                target=self._session_worker_loop,
+                name="cider-agent-session-worker",
+                daemon=True,
+            )
+            self._session_worker_thread.start()
+
+    def stop_background_session_worker(self) -> None:
+        with self._session_worker_lock:
+            self._session_worker_stop.set()
+            thread = self._session_worker_thread
+            self._session_worker_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -258,6 +306,7 @@ class CiderAgentService:
         return {"status": "ok", "result": self._rpc.playback_post("/playpause")}
 
     def stop(self) -> dict[str, Any]:
+        self._preferences.stop_active_session()
         return {"status": "ok", "result": self._rpc.playback_post("/stop")}
 
     def next_track(self) -> dict[str, Any]:
@@ -596,6 +645,72 @@ class CiderAgentService:
             "playback": play_result,
         }
 
+    def session_status(self, *, include_recent_tracks: bool = True) -> dict[str, Any]:
+        session = self._preferences.get_active_session()
+        if session is None:
+            return {"status": "ok", "session": None}
+        payload = {"status": "ok", "session": session}
+        if include_recent_tracks:
+            payload["recent_tracks"] = self.recent_session_tracks(limit=self.session_recent_tracks_limit())
+        return payload
+
+    def recent_session_tracks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        session = self._preferences.get_active_session()
+        if session is None:
+            return []
+        return self._preferences.list_session_tracks(session["id"], limit=limit or self.session_recent_tracks_limit())
+
+    def stop_session(self) -> dict[str, Any]:
+        stopped = self._preferences.stop_active_session()
+        return {"status": "ok", "stopped": stopped is not None, "session": stopped}
+
+    def play_session(self, request: str) -> dict[str, Any]:
+        if not request.strip():
+            raise CiderValidationError("request cannot be empty.")
+        session = self._preferences.start_session(request_text=request.strip())
+        try:
+            self.clear_queue()
+        except CiderAgentError:
+            LOGGER.debug("Could not clear queue before starting session.", exc_info=True)
+        result = self._refill_session(session, interrupt_playback=True)
+        return {
+            "status": "ok",
+            "mode": "adaptive-session",
+            "session": self._preferences.get_session(session["id"]),
+            "result": result,
+        }
+
+    def steer_session(self, request: str) -> dict[str, Any]:
+        if not request.strip():
+            raise CiderValidationError("request cannot be empty.")
+        session = self._preferences.get_active_session()
+        if session is None:
+            raise CiderValidationError("No active session is running.")
+        session = self._preferences.add_session_steering(session["id"], request.strip())
+        try:
+            self.clear_queue()
+        except CiderAgentError:
+            LOGGER.debug("Could not clear queue while steering session.", exc_info=True)
+        result = self._refill_session(session, interrupt_playback=False)
+        return {
+            "status": "ok",
+            "mode": "adaptive-session",
+            "session": self._preferences.get_session(session["id"]),
+            "result": result,
+        }
+
+    def refill_active_session(self) -> dict[str, Any]:
+        session = self._preferences.get_active_session()
+        if session is None:
+            raise CiderValidationError("No active session is running.")
+        result = self._refill_session(session, interrupt_playback=False)
+        return {
+            "status": "ok",
+            "mode": "adaptive-session",
+            "session": self._preferences.get_session(session["id"]),
+            "result": result,
+        }
+
     def play_candidate_match(
         self,
         *,
@@ -720,6 +835,11 @@ class CiderAgentService:
                 is_library=bool(params.get("is_library", False)),
             ),
             "play_item_href": lambda: self.play_item_href(str(params["href"])),
+            "play_session": lambda: self.play_session(str(params["request"])),
+            "steer_session": lambda: self.steer_session(str(params["request"])),
+            "session_status": self.session_status,
+            "stop_session": self.stop_session,
+            "refill_session": self.refill_active_session,
             "search_catalog": lambda: self.search_catalog(
                 str(params["query"]),
                 limit=int(params.get("limit", 10)),
@@ -812,6 +932,170 @@ class CiderAgentService:
             "request_id": str(uuid.uuid4()),
         }
 
+    def _session_worker_loop(self) -> None:
+        while not self._session_worker_stop.wait(self.SESSION_REFILL_INTERVAL_SECONDS):
+            try:
+                session = self._preferences.get_active_session()
+                if session is None:
+                    continue
+                self._record_current_track_for_session(session)
+                queue = self.get_queue()
+                if queue["count"] < self.SESSION_QUEUE_REFILL_THRESHOLD:
+                    self._refill_session(session, interrupt_playback=False)
+            except Exception:
+                LOGGER.exception("Adaptive session worker failed during refill loop.")
+
+    def _refill_session(self, session: dict[str, Any], *, interrupt_playback: bool) -> dict[str, Any]:
+        self._record_current_track_for_session(session)
+        queue = self.get_queue()
+        needed = self.SESSION_QUEUE_TARGET_SIZE if interrupt_playback else max(0, self.SESSION_QUEUE_TARGET_SIZE - queue["count"])
+        if needed <= 0:
+            self._preferences.touch_session_refill(session["id"])
+            return {
+                "status": "ok",
+                "selection_strategy": "session-queue-unchanged",
+                "enqueued_count": 0,
+                "tracks": [],
+            }
+
+        plan = self._plan_session_tracks(session, count=max(needed, 1))
+        tracks = self._collect_session_tracks(plan, limit=max(needed, 1))
+        if not tracks:
+            raise CiderValidationError("No playable candidate match could be resolved.")
+
+        selected_tracks = tracks[: max(needed, 1)]
+        playback: dict[str, Any] | None = None
+        enqueued: list[dict[str, Any]] = []
+        if interrupt_playback:
+            lead_track = selected_tracks[0]
+            playback = self._play_flattened_track(lead_track, is_library_default=False)
+            self._preferences.add_session_track(session["id"], lead_track)
+            for track in selected_tracks[1:]:
+                self._enqueue_flattened_track(track)
+                enqueued.append(track)
+        else:
+            for track in selected_tracks:
+                self._enqueue_flattened_track(track)
+                enqueued.append(track)
+        self._preferences.touch_session_refill(session["id"])
+        return {
+            "status": "ok",
+            "selection_strategy": "adaptive-session-refill",
+            "playback": playback,
+            "enqueued_count": len(enqueued),
+            "tracks": selected_tracks,
+            "plan": {
+                "candidate_tracks": plan.candidate_tracks,
+                "candidate_artists": plan.candidate_artists,
+                "candidate_queries": plan.candidate_queries,
+            },
+        }
+
+    def _plan_session_tracks(self, session: dict[str, Any], *, count: int) -> SessionPlan:
+        planner = getattr(self._resolver, "plan_session", None)
+        if not callable(planner):
+            raise CiderValidationError("The configured resolver does not support adaptive play sessions.")
+        request = self._session_effective_request(session)
+        return planner(request, self, session, count)
+
+    def _session_effective_request(self, session: dict[str, Any]) -> str:
+        steering = session.get("steering_history", [])
+        if not steering:
+            return str(session.get("request_text", "")).strip()
+        steering_text = " ".join(str(item).strip() for item in steering if str(item).strip())
+        if not steering_text:
+            return str(session.get("request_text", "")).strip()
+        return f"{session.get('request_text', '').strip()} Current steering: {steering_text}".strip()
+
+    def _collect_session_tracks(self, plan: SessionPlan, *, limit: int) -> list[dict[str, Any]]:
+        excluded_ids = self._session_excluded_track_ids()
+        chosen: list[dict[str, Any]] = []
+        seen_ids = set(excluded_ids)
+
+        for candidate in plan.candidate_tracks:
+            if len(chosen) >= limit:
+                break
+            title = str(candidate.get("title", "")).strip()
+            artist = str(candidate.get("artist", "")).strip()
+            if not title or not artist:
+                continue
+            search = self.search_catalog_tracks(f"{artist} {title}", limit=10)
+            match = self._best_track_match(search["tracks"], title=title, artist=artist)
+            if match is None:
+                continue
+            match_id = str(match.get("id", "")).strip()
+            if match_id and match_id in seen_ids:
+                continue
+            chosen.append(match)
+            if match_id:
+                seen_ids.add(match_id)
+
+        for artist in plan.candidate_artists:
+            if len(chosen) >= limit:
+                break
+            search = self.search_catalog_tracks(str(artist), limit=15)
+            for match in self._best_artist_track_matches(search["tracks"], artist=str(artist), limit=limit - len(chosen)):
+                match_id = str(match.get("id", "")).strip()
+                if match_id and match_id in seen_ids:
+                    continue
+                chosen.append(match)
+                if match_id:
+                    seen_ids.add(match_id)
+                if len(chosen) >= limit:
+                    break
+
+        for query in plan.candidate_queries:
+            if len(chosen) >= limit:
+                break
+            results = self.search(str(query), limit=25)
+            for track in results.get("tracks", []):
+                match_id = str(track.get("id", "")).strip()
+                if match_id and match_id in seen_ids:
+                    continue
+                chosen.append(track)
+                if match_id:
+                    seen_ids.add(match_id)
+                if len(chosen) >= limit:
+                    break
+
+        return chosen
+
+    def _session_excluded_track_ids(self) -> set[str]:
+        excluded: set[str] = set()
+        current = self.get_now_playing().get("track", {})
+        current_id = _clean_id(current.get("play_params", {}).get("id"))
+        if current_id:
+            excluded.add(current_id)
+        for track in self.recent_session_tracks(limit=self.session_recent_tracks_limit()):
+            track_id = _clean_id(track.get("track_id"))
+            if track_id:
+                excluded.add(track_id)
+        queue = self.get_queue()
+        for item in queue.get("items", []):
+            queue_track_id = _clean_id(item.get("track", {}).get("play_params", {}).get("id"))
+            if queue_track_id:
+                excluded.add(queue_track_id)
+        return excluded
+
+    def _record_current_track_for_session(self, session: dict[str, Any]) -> None:
+        current = self.get_now_playing().get("track", {})
+        current_id = _clean_id(current.get("play_params", {}).get("id"))
+        if not current_id:
+            return
+        recent = self._preferences.list_session_tracks(session["id"], limit=1)
+        if recent and _clean_id(recent[0].get("track_id")) == current_id:
+            return
+        self._preferences.add_session_track(
+            session["id"],
+            {
+                "id": current_id,
+                "title": current.get("title"),
+                "artist": current.get("artist"),
+                "album": current.get("album"),
+                "href": current.get("href"),
+            },
+        )
+
     def _extract_is_playing(self, payload: Any) -> bool | None:
         if isinstance(payload, bool):
             return payload
@@ -886,12 +1170,16 @@ class CiderAgentService:
         return None
 
     def _best_artist_track_match(self, tracks: list[dict[str, Any]], *, artist: str) -> dict[str, Any] | None:
+        matches = self._best_artist_track_matches(tracks, artist=artist, limit=1)
+        return matches[0] if matches else None
+
+    def _best_artist_track_matches(self, tracks: list[dict[str, Any]], *, artist: str, limit: int) -> list[dict[str, Any]]:
         artist_norm = _normalize_match_text(artist)
         exact_artist_tracks = [track for track in tracks if _normalize_match_text(track.get("artist")) == artist_norm]
         if not exact_artist_tracks:
-            return None
+            return []
         scored = sorted(exact_artist_tracks, key=self._artist_track_score, reverse=True)
-        return scored[0]
+        return scored[:limit]
 
     def _artist_track_score(self, track: dict[str, Any]) -> tuple[int, int]:
         album = _normalize_match_text(track.get("album"))
@@ -918,3 +1206,12 @@ class CiderAgentService:
         if not item_id:
             raise CiderValidationError("Resolved track did not include a playable id.")
         return self.play_item(item_id, kind=kind, is_library=is_library)
+
+    def _enqueue_flattened_track(self, track: dict[str, Any]) -> dict[str, Any]:
+        play_params = track.get("play_params", {})
+        item_id = str(play_params.get("id", "")).strip()
+        kind = str(play_params.get("kind", "songs")).strip() or "songs"
+        is_library = bool(play_params.get("is_library", False))
+        if not item_id:
+            raise CiderValidationError("Resolved track did not include a playable id.")
+        return self.play_later({"id": item_id, "type": kind, "isLibrary": is_library})

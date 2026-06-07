@@ -85,6 +85,7 @@ class Settings:
     resolver_api_key: str | None = None
     resolver_include_reasoning: bool = False
     resolver_include_raw_output: bool = False
+    session_recent_tracks_limit: int = 20
     request_timeout_seconds: float = 60.0
     verify_tls: bool = True
     log_level: str = "INFO"
@@ -131,6 +132,14 @@ class Settings:
                 False,
             )
         )
+        session_recent_tracks_limit = int(
+            _config_or_env(
+                config,
+                "CIDER_AGENT_SESSION_RECENT_TRACKS_LIMIT",
+                "session_recent_tracks_limit",
+                20,
+            )
+        )
         request_timeout_seconds = float(
             _config_or_env(config, "CIDER_AGENT_REQUEST_TIMEOUT_SECONDS", "request_timeout_seconds", 60.0)
         )
@@ -167,6 +176,8 @@ class Settings:
             raise CiderConfigError("resolver_base_url cannot be empty.")
         if resolver_backend == "openai_compatible" and not resolver_model:
             raise CiderConfigError("resolver_model is required when resolver_backend is openai_compatible.")
+        if session_recent_tracks_limit <= 0 or session_recent_tracks_limit > 200:
+            raise CiderConfigError("session_recent_tracks_limit must be between 1 and 200.")
         if request_timeout_seconds <= 0:
             raise CiderConfigError("request_timeout_seconds must be positive.")
         if log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
@@ -185,6 +196,7 @@ class Settings:
             resolver_api_key=resolver_api_key,
             resolver_include_reasoning=resolver_include_reasoning,
             resolver_include_raw_output=resolver_include_raw_output,
+            session_recent_tracks_limit=session_recent_tracks_limit,
             request_timeout_seconds=request_timeout_seconds,
             verify_tls=verify_tls,
             log_level=log_level,
@@ -209,6 +221,7 @@ class Settings:
             "has_resolver_api_key": bool(self.resolver_api_key),
             "resolver_include_reasoning": self.resolver_include_reasoning,
             "resolver_include_raw_output": self.resolver_include_raw_output,
+            "session_recent_tracks_limit": self.session_recent_tracks_limit,
             "request_timeout_seconds": self.request_timeout_seconds,
             "verify_tls": self.verify_tls,
             "log_level": self.log_level,

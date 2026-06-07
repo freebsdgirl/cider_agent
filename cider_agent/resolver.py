@@ -25,11 +25,27 @@ class ResolvedAction:
     raw_content: str | None = None
 
 
+@dataclass
+class SessionPlan:
+    """Candidate tracks and fallback queries for an adaptive play session."""
+
+    candidate_tracks: list[dict[str, str]]
+    candidate_artists: list[str]
+    candidate_queries: list[str]
+    resolver: str
+    raw: dict[str, Any] | None = None
+    reasoning: str | None = None
+    raw_content: str | None = None
+
+
 class Resolver(Protocol):
     """Resolve freeform user text into a structured action."""
 
     def resolve(self, text: str, service: Any) -> ResolvedAction:
         """Resolve text into an action."""
+
+    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionPlan:
+        """Generate the next candidate tracks for an adaptive session."""
 
 
 class FallbackResolver:
@@ -53,6 +69,15 @@ class FallbackResolver:
                 "Use a structured action or enable the openai_compatible resolver."
             )
         return ResolvedAction(action=action, parameters={}, resolver="fallback")
+
+    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionPlan:
+        query = request.strip()
+        return SessionPlan(
+            candidate_tracks=[],
+            candidate_artists=[],
+            candidate_queries=[query] if query else [],
+            resolver="fallback",
+        )
 
 
 class OpenAICompatibleResolver:
@@ -80,29 +105,7 @@ class OpenAICompatibleResolver:
         if self._settings.resolver_api_key:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
 
-        prompt = self._build_messages(text, service)
-        payload = {
-            "model": self._settings.resolver_model,
-            "messages": prompt,
-        }
-        try:
-            response = self._session.post("/chat/completions", headers=headers, json=payload)
-        except httpx.HTTPError as exc:
-            raise ResolverError(f"Could not reach resolver endpoint at {self._settings.resolver_base_url}: {exc}") from exc
-
-        if response.is_error:
-            try:
-                detail = response.json()
-            except ValueError:
-                detail = response.text
-            raise ResolverError(f"Resolver endpoint returned HTTP {response.status_code}: {detail}")
-
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise ResolverError("Resolver endpoint returned non-JSON output.") from exc
-
-        content = self._extract_content(body)
+        body, content = self._complete_json(self._build_messages(text, service), headers)
         parsed = self._parse_json_object(content)
         action = str(parsed.get("action", "")).strip()
         parameters = parsed.get("parameters", {})
@@ -120,15 +123,41 @@ class OpenAICompatibleResolver:
             raw_content=self._extract_raw_content(content),
         )
 
+    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionPlan:
+        headers = {"Content-Type": "application/json"}
+        if self._settings.resolver_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
+        body, content = self._complete_json(self._build_session_messages(request, service, session, count), headers)
+        parsed = self._parse_json_object(content)
+        candidate_tracks = self._normalize_candidate_tracks(parsed.get("candidate_tracks"))
+        candidate_artists = self._normalize_candidate_artists(parsed.get("candidate_artists"))
+        candidate_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))
+        if not candidate_queries:
+            synthesized = self._fallback_query_from_text(request)
+            if synthesized:
+                candidate_queries = [synthesized]
+        return SessionPlan(
+            candidate_tracks=candidate_tracks,
+            candidate_artists=candidate_artists,
+            candidate_queries=candidate_queries,
+            resolver="openai_compatible",
+            raw=parsed,
+            reasoning=self._extract_reasoning(body),
+            raw_content=self._extract_raw_content(content),
+        )
+
     def _build_messages(self, text: str, service: Any) -> list[dict[str, str]]:
         playback = service.playback_snapshot()
+        active_session = service.session_status(include_recent_tracks=False).get("session")
         context = {
+            "current_timestamp": service.current_timestamp(),
             "default_search_source": service.default_search_source(),
             "playback_summary": {
                 "is_playing": playback.get("is_playing"),
                 "track": playback.get("track"),
                 "queue_length": playback.get("queue_length"),
             },
+            "active_session": active_session,
             "preferences": service.list_preferences()["preferences"][:5],
             "supported_actions": [
                 "status",
@@ -152,6 +181,10 @@ class OpenAICompatibleResolver:
                 "search_catalog_tracks",
                 "search_library_tracks",
                 "play_candidate_match",
+                "play_session",
+                "steer_session",
+                "session_status",
+                "stop_session",
                 "play_search_result",
                 "remember_preference",
                 "list_preferences",
@@ -164,7 +197,9 @@ class OpenAICompatibleResolver:
                 "Use source='default' when selecting search results unless the request explicitly mentions library or catalog.",
                 "Playlist creation and add-track mutation are unsupported and must not be selected.",
                 "If the user names a specific song and artist, you may use play_search_result or play_candidate_match.",
-                "If the user asks for a vibe, era, popularity, or descriptive request, prefer play_candidate_match.",
+                "If the user asks for a vibe, era, popularity, activity, time-of-day, or descriptive request, prefer play_session.",
+                "If the user asks for something by an artist without naming a specific track, prefer play_session.",
+                "If there is an active session and the user asks for a change like 'more pop' or 'more of this artist', prefer steer_session.",
                 "For play_candidate_match, provide candidate_tracks as [{'title': ..., 'artist': ...}] when possible.",
                 "For play_candidate_match, provide candidate_artists only as fallback support.",
                 "For play_candidate_match, always include candidate_queries for descriptive requests as last-resort fallback search phrases.",
@@ -180,6 +215,7 @@ class OpenAICompatibleResolver:
             "Return only JSON with shape {\"action\": string, \"parameters\": object}. "
             "Do not explain your reasoning. "
             "Prefer direct execution actions over informational searches when the user clearly asked to play or pause something. "
+            "Treat generic or descriptive play requests as adaptive long-form listening sessions. "
             "For descriptive playback requests, propose concrete track and artist candidates rather than a literal English search phrase. "
             "Never invent obviously fake artist or song names; if you are unsure, include candidate_queries fallback phrases."
         )
@@ -187,6 +223,54 @@ class OpenAICompatibleResolver:
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nRequest:\n{text}"},
         ]
+
+    def _build_session_messages(self, request: str, service: Any, session: dict[str, Any], count: int) -> list[dict[str, str]]:
+        context = {
+            "current_timestamp": service.current_timestamp(),
+            "session_request": session.get("request_text"),
+            "session_steering": session.get("steering_history", [])[-5:],
+            "recent_tracks": service.recent_session_tracks(limit=service.session_recent_tracks_limit()),
+            "playback_summary": service.playback_snapshot(),
+            "preferences": service.list_preferences()["preferences"][:5],
+            "count": count,
+        }
+        system = (
+            "You are planning the next tracks for an adaptive music session in cider_agent. "
+            "Return only JSON with keys candidate_tracks, candidate_artists, and candidate_queries. "
+            "candidate_tracks must be a list of objects shaped like {\"title\": string, \"artist\": string}. "
+            "Use real, attributable music. Do not invent fake artist or track names. "
+            "Avoid repeating tracks from recent_tracks unless truly necessary. "
+            "Honor the original session_request, steering changes, and the current timestamp. "
+            "If the request is generic, you may adapt to time of day, such as higher energy in the morning and calmer music late at night. "
+            "Always include at least one candidate_queries fallback phrase."
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nPlan the next tracks for this session."},
+        ]
+
+    def _complete_json(self, messages: list[dict[str, str]], headers: dict[str, str]) -> tuple[dict[str, Any], str]:
+        payload = {
+            "model": self._settings.resolver_model,
+            "messages": messages,
+        }
+        try:
+            response = self._session.post("/chat/completions", headers=headers, json=payload)
+        except httpx.HTTPError as exc:
+            raise ResolverError(f"Could not reach resolver endpoint at {self._settings.resolver_base_url}: {exc}") from exc
+
+        if response.is_error:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = response.text
+            raise ResolverError(f"Resolver endpoint returned HTTP {response.status_code}: {detail}")
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ResolverError("Resolver endpoint returned non-JSON output.") from exc
+        return body, self._extract_content(body)
 
     def _extract_content(self, body: dict[str, Any]) -> str:
         choices = body.get("choices")
@@ -253,6 +337,12 @@ class OpenAICompatibleResolver:
                 if synthesized:
                     normalized["candidate_queries"] = [synthesized]
             normalized.pop("candidate_query", None)
+        if action in {"play_session", "steer_session"}:
+            request = normalized.get("request")
+            if isinstance(request, str):
+                normalized["request"] = request.strip()
+            elif original_text.strip():
+                normalized["request"] = original_text.strip()
         return normalized
 
     def _normalize_query_text(self, query: str) -> str:
