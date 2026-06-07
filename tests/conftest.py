@@ -77,6 +77,26 @@ class StubRpcClient:
         return {"path": path, "body": body}
 
     def search_catalog(self, query: str, *, limit: int, storefront: str):
+        if query == "Favorite Artist Liked Song":
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": "catalog-track-favorite",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": "Liked Song",
+                                        "artistName": "Favorite Artist",
+                                        "playParams": {"id": "catalog-track-favorite", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
         return {
             "data": {
                 "results": {
@@ -175,9 +195,15 @@ class StubResolver:
     def resolve(self, text: str, service: Any) -> ResolvedAction:
         normalized = text.strip().lower()
         if "kep1er" in normalized:
+            return ResolvedAction(action="search", parameters={"query": "kep1er", "limit": 3, "storefront": "us"}, resolver="stub")
+        if "pink" in normalized:
             return ResolvedAction(
-                action="search",
-                parameters={"query": "kep1er", "limit": 3, "storefront": "us"},
+                action="play_candidate_match",
+                parameters={
+                    "candidate_tracks": [{"title": "Just Give Me a Reason", "artist": "P!nk"}],
+                    "candidate_artists": ["P!nk"],
+                    "candidate_queries": ["Pink"],
+                },
                 resolver="stub",
             )
         return ResolvedAction(action="status", parameters={}, resolver="stub")
@@ -197,6 +223,7 @@ def settings(tmp_path: Path) -> Settings:
         resolver_model=None,
         resolver_api_key=None,
         resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
         request_timeout_seconds=10.0,
         verify_tls=True,
         log_level="INFO",

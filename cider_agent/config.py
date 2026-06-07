@@ -84,6 +84,7 @@ class Settings:
     resolver_model: str | None = None
     resolver_api_key: str | None = None
     resolver_include_reasoning: bool = False
+    resolver_include_raw_output: bool = False
     request_timeout_seconds: float = 60.0
     verify_tls: bool = True
     log_level: str = "INFO"
@@ -119,6 +120,14 @@ class Settings:
                 config,
                 "CIDER_AGENT_RESOLVER_INCLUDE_REASONING",
                 "resolver_include_reasoning",
+                False,
+            )
+        )
+        resolver_include_raw_output = _as_bool(
+            _config_or_env(
+                config,
+                "CIDER_AGENT_RESOLVER_INCLUDE_RAW_OUTPUT",
+                "resolver_include_raw_output",
                 False,
             )
         )
@@ -175,6 +184,7 @@ class Settings:
             resolver_model=resolver_model,
             resolver_api_key=resolver_api_key,
             resolver_include_reasoning=resolver_include_reasoning,
+            resolver_include_raw_output=resolver_include_raw_output,
             request_timeout_seconds=request_timeout_seconds,
             verify_tls=verify_tls,
             log_level=log_level,
@@ -198,6 +208,7 @@ class Settings:
             "resolver_model": self.resolver_model,
             "has_resolver_api_key": bool(self.resolver_api_key),
             "resolver_include_reasoning": self.resolver_include_reasoning,
+            "resolver_include_raw_output": self.resolver_include_raw_output,
             "request_timeout_seconds": self.request_timeout_seconds,
             "verify_tls": self.verify_tls,
             "log_level": self.log_level,

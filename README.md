@@ -49,6 +49,7 @@ Environment variable overrides are available for every field:
 - `CIDER_AGENT_RESOLVER_MODEL`
 - `CIDER_AGENT_RESOLVER_API_KEY`
 - `CIDER_AGENT_RESOLVER_INCLUDE_REASONING`
+- `CIDER_AGENT_RESOLVER_INCLUDE_RAW_OUTPUT`
 - `CIDER_AGENT_REQUEST_TIMEOUT_SECONDS`
 - `CIDER_AGENT_VERIFY_TLS`
 - `CIDER_AGENT_LOG_LEVEL`
@@ -132,7 +133,9 @@ Common actions:
 - The RPC client sends both `apptoken` and `apitoken` headers because shipped Cider builds vary.
 - Generic `search` uses `default_search_source` from config, which defaults to `catalog`.
 - Text requests go through the configured resolver backend. `fallback` only supports tiny direct commands like `play` and `pause`; `openai_compatible` sends chat-completions requests to a configurable OpenAI-style endpoint, including local endpoints such as Ollama when they expose the same API shape.
+- For descriptive playback requests, the resolver can now return concrete candidate tracks and artists, and `cider_agent` validates those against Apple Music before playing them.
 - `resolver_include_reasoning` is a debug-only option. When enabled, `cider_agent` will include model-provided reasoning text in output if the resolver backend returns it.
+- `resolver_include_raw_output` is another debug-only option. When enabled, `cider_agent` will include the resolver's exact raw `message.content` string as `resolver_raw_content`, plus the parsed JSON object as `resolver_raw_action`.
 - The default request timeout is 60 seconds to accommodate slower local models and Cider RPC calls.
 - Live verification against a current Cider build showed `/api/v1/amapi/run-v3` behaves as a read-only `path` passthrough. Playlist creation and add-track mutation are therefore not exposed in this version of `cider_agent`.
 - The web UI is intentionally not part of v1, but the service layer is transport-agnostic so a future local UI can reuse the same operations.

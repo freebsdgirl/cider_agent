@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .app import get_service, get_settings
-from .errors import CiderAgentError, CiderValidationError
+from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
 
 
 def _iso_now() -> str:
@@ -216,6 +216,10 @@ def _execute_message(message: dict[str, Any], *, task_id: str | None = None, con
         task["metadata"]["resolved_action"] = resolved["resolved_action"]
         if "reasoning" in resolved:
             task["metadata"]["reasoning"] = resolved["reasoning"]
+        if "resolver_raw_content" in resolved:
+            task["metadata"]["resolver_raw_content"] = resolved["resolver_raw_content"]
+        if "resolver_raw_action" in resolved:
+            task["metadata"]["resolver_raw_action"] = resolved["resolver_raw_action"]
     TASK_STORE.save(task)
     return task
 
@@ -324,6 +328,8 @@ def create_a2a_app() -> FastAPI:
                     },
                 )
             return _jsonrpc_response(request_id, error=_jsonrpc_error(-32601, f"Unknown method: {method}"))
+        except TextRequestExecutionError as exc:
+            return _jsonrpc_response(request_id, error=_jsonrpc_error(-32000, str(exc), data=exc.payload))
         except CiderAgentError as exc:
             return _jsonrpc_response(request_id, error=_jsonrpc_error(-32000, str(exc)))
         except Exception as exc:  # pragma: no cover - defensive fallback

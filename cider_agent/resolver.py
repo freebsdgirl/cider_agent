@@ -22,6 +22,7 @@ class ResolvedAction:
     resolver: str
     raw: dict[str, Any] | None = None
     reasoning: str | None = None
+    raw_content: str | None = None
 
 
 class Resolver(Protocol):
@@ -109,13 +110,14 @@ class OpenAICompatibleResolver:
             raise ResolverError("Resolver output did not include an action.")
         if not isinstance(parameters, dict):
             raise ResolverError("Resolver output parameters must be an object.")
-        parameters = self._normalize_parameters(action, parameters)
+        parameters = self._normalize_parameters(action, parameters, original_text=text)
         return ResolvedAction(
             action=action,
             parameters=parameters,
             resolver="openai_compatible",
             raw=parsed,
             reasoning=self._extract_reasoning(body),
+            raw_content=self._extract_raw_content(content),
         )
 
     def _build_messages(self, text: str, service: Any) -> list[dict[str, str]]:
@@ -149,6 +151,7 @@ class OpenAICompatibleResolver:
                 "search_library",
                 "search_catalog_tracks",
                 "search_library_tracks",
+                "play_candidate_match",
                 "play_search_result",
                 "remember_preference",
                 "list_preferences",
@@ -160,9 +163,13 @@ class OpenAICompatibleResolver:
                 "Return JSON only with keys action and parameters.",
                 "Use source='default' when selecting search results unless the request explicitly mentions library or catalog.",
                 "Playlist creation and add-track mutation are unsupported and must not be selected.",
-                "If the user asks to play a song, artist, or search phrase, prefer play_search_result with query text and index 0.",
-                "For search or play_search_result, query should be the minimal artist/song text, not a descriptive phrase.",
-                "Bad query example: 'popular songs by Pink'. Good query example: 'Pink'.",
+                "If the user names a specific song and artist, you may use play_search_result or play_candidate_match.",
+                "If the user asks for a vibe, era, popularity, or descriptive request, prefer play_candidate_match.",
+                "For play_candidate_match, provide candidate_tracks as [{'title': ..., 'artist': ...}] when possible.",
+                "For play_candidate_match, provide candidate_artists only as fallback support.",
+                "For play_candidate_match, always include candidate_queries for descriptive requests as last-resort fallback search phrases.",
+                "Do not invent fake artists or track titles. Prefer real, attributable music. If uncertain, rely more on candidate_queries.",
+                "Bad fallback query example: 'popular songs by Pink'. Better candidate artist: 'P!nk'. Better candidate tracks might be her known singles.",
                 "If the user asks what is playing, use get_now_playing.",
                 "If the user asks to resume, use play. If the user asks to pause, use pause.",
             ],
@@ -172,7 +179,9 @@ class OpenAICompatibleResolver:
             "Convert a user request into one structured action for the supported action set. "
             "Return only JSON with shape {\"action\": string, \"parameters\": object}. "
             "Do not explain your reasoning. "
-            "Prefer direct execution actions over informational searches when the user clearly asked to play or pause something."
+            "Prefer direct execution actions over informational searches when the user clearly asked to play or pause something. "
+            "For descriptive playback requests, propose concrete track and artist candidates rather than a literal English search phrase. "
+            "Never invent obviously fake artist or song names; if you are unsure, include candidate_queries fallback phrases."
         )
         return [
             {"role": "system", "content": system},
@@ -204,6 +213,12 @@ class OpenAICompatibleResolver:
             return reasoning.strip()
         return None
 
+    def _extract_raw_content(self, content: str) -> str | None:
+        if not self._settings.resolver_include_raw_output:
+            return None
+        trimmed = content.strip()
+        return trimmed or None
+
     def _parse_json_object(self, content: str) -> dict[str, Any]:
         content = content.strip()
         start = content.find("{")
@@ -218,7 +233,7 @@ class OpenAICompatibleResolver:
             raise ResolverError("Resolver output JSON must be an object.")
         return parsed
 
-    def _normalize_parameters(self, action: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_parameters(self, action: str, parameters: dict[str, Any], *, original_text: str) -> dict[str, Any]:
         normalized = dict(parameters)
         if action in {"search", "search_catalog", "search_library", "search_catalog_tracks", "search_library_tracks", "play_search_result"}:
             query = normalized.get("query")
@@ -226,6 +241,18 @@ class OpenAICompatibleResolver:
                 normalized_query = self._normalize_query_text(query)
                 if normalized_query:
                     normalized["query"] = normalized_query
+        if action == "play_candidate_match":
+            normalized["candidate_tracks"] = self._normalize_candidate_tracks(normalized.get("candidate_tracks"))
+            normalized["candidate_artists"] = self._normalize_candidate_artists(normalized.get("candidate_artists"))
+            fallback_queries = normalized.get("candidate_queries")
+            if fallback_queries is None:
+                fallback_queries = normalized.get("candidate_query")
+            normalized["candidate_queries"] = self._normalize_candidate_queries(fallback_queries)
+            if not normalized["candidate_queries"]:
+                synthesized = self._fallback_query_from_text(original_text)
+                if synthesized:
+                    normalized["candidate_queries"] = [synthesized]
+            normalized.pop("candidate_query", None)
         return normalized
 
     def _normalize_query_text(self, query: str) -> str:
@@ -242,6 +269,44 @@ class OpenAICompatibleResolver:
             cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
         cleaned = cleaned.strip(" .,:;!?\"'")
         return cleaned or query.strip()
+
+    def _fallback_query_from_text(self, text: str) -> str:
+        cleaned = self._normalize_query_text(text)
+        lowered = cleaned.casefold()
+        if lowered.startswith("music for "):
+            subject = cleaned[10:].strip()
+            return f"{subject} music".strip() if subject else cleaned
+        if lowered.startswith("music to "):
+            subject = cleaned[9:].strip()
+            subject = re.sub(r"^make me\s+", "", subject, flags=re.IGNORECASE)
+            return f"{subject} music".strip() if subject else cleaned
+        return cleaned
+
+    def _normalize_candidate_tracks(self, value: Any) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        tracks: list[dict[str, str]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            artist = str(item.get("artist", "")).strip()
+            if title and artist:
+                tracks.append({"title": title, "artist": artist})
+        return tracks
+
+    def _normalize_candidate_artists(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _normalize_candidate_queries(self, value: Any) -> list[str]:
+        if isinstance(value, str):
+            normalized = self._normalize_query_text(value)
+            return [normalized] if normalized else []
+        if not isinstance(value, list):
+            return []
+        return [self._normalize_query_text(str(item)) for item in value if str(item).strip()]
 
 
 def build_resolver(settings: Settings) -> Resolver:

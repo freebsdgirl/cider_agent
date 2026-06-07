@@ -14,6 +14,7 @@ def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
                     "cider_api_token": "from-config",
                     "default_search_source": "library",
                     "resolver_include_reasoning": True,
+                    "resolver_include_raw_output": True,
                     "database_path": str(tmp_path / "db.sqlite3"),
                 }
             ),
@@ -27,4 +28,5 @@ def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
     assert settings.cider_api_token == "from-config"
     assert settings.default_search_source == "library"
     assert settings.resolver_include_reasoning is True
+    assert settings.resolver_include_raw_output is True
     assert settings.database_path == tmp_path / "db.sqlite3"

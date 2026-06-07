@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class CiderAgentError(Exception):
     """Base error for the project."""
@@ -30,3 +32,11 @@ class PreferenceStoreError(CiderAgentError):
 
 class ResolverError(CiderAgentError):
     """Raised when the text-to-action resolver fails."""
+
+
+class TextRequestExecutionError(CiderAgentError):
+    """Raised when a resolved text request fails during execution."""
+
+    def __init__(self, message: str, payload: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.payload = payload

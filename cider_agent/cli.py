@@ -8,7 +8,7 @@ import sys
 from typing import Any
 
 from .app import get_service
-from .errors import CiderAgentError
+from .errors import CiderAgentError, TextRequestExecutionError
 
 
 def _print_payload(payload: dict[str, Any], as_json: bool) -> None:
@@ -217,6 +217,9 @@ def main() -> None:
                 payload = service.recommend(query=args.query, limit=args.limit)
         else:  # pragma: no cover - argparse enforces commands
             raise RuntimeError(f"Unhandled command: {args.command}")
+    except TextRequestExecutionError as exc:
+        print(json.dumps(exc.payload, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1) from None
     except CiderAgentError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
