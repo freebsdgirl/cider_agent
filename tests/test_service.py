@@ -83,6 +83,7 @@ def test_handle_text_request_uses_resolver(service) -> None:
     assert result["resolver"] == "stub"
     assert result["resolved_action"]["action"] == "search"
     assert result["execution"]["action"] == "search"
+    assert isinstance(result["summary"], str)
 
 
 def test_handle_text_request_can_start_adaptive_session(service) -> None:
@@ -95,6 +96,7 @@ def test_handle_text_request_can_start_adaptive_session(service) -> None:
     assert "plan" not in result["execution"]["result"]["result"]
     assert result["execution"]["result"]["result"]["enqueued_count"] == 0
     assert "primary_track" in result["execution"]["result"]["result"]
+    assert result["summary"].startswith("playing ")
 
 
 def test_steer_session_updates_active_session(service) -> None:

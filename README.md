@@ -1,6 +1,6 @@
 # Cider Agent
 
-`cider_agent` is a standalone Python service that owns audio control for the Cider Apple Music client. It gives other agents a strict A2A-style endpoint for delegating music tasks, plus a local CLI for direct use.
+`cider_agent` is a standalone Python service that owns audio control for the Cider Apple Music client. It gives other agents a text-first A2A endpoint for delegating music tasks, plus a local CLI for direct use.
 
 V1 includes:
 
@@ -87,9 +87,50 @@ Published endpoints:
 - `GET /.well-known/agent-card.json`
 - `GET /healthz`
 
-## A2A request shape
+## A2A integration
 
-Use a JSON-RPC 2.0 request against `/a2a` with `method` set to `message/send` or `message/stream`.
+The intended integration path is plain-language text requests over A2A. Upstream conversational agents do not need to know the internal action schema. In the common case, they only need to know:
+
+- `cider_agent` exists
+- it accepts natural-language music requests
+- it returns compact structured results
+
+Recommended request shape:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "message/send",
+  "params": {
+    "message": {
+      "kind": "message",
+      "messageId": "msg-1",
+      "role": "user",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "play upbeat morning music"
+        }
+      ]
+    }
+  }
+}
+```
+
+Typical text requests:
+
+- `play upbeat morning music`
+- `add some KATSEYE`
+- `more pop`
+- `i don't like this`
+- `what's playing?`
+
+Responses include a compact `summary` field for tool-friendly consumption, plus the structured execution payload.
+
+## Advanced structured actions
+
+Structured requests still exist for advanced integrations and testing, but they are not required for ordinary use.
 
 Structured requests should send a `data` part:
 
@@ -119,7 +160,7 @@ Structured requests should send a `data` part:
 }
 ```
 
-Common actions:
+Common structured actions:
 
 - `status`
 - `get_now_playing`
@@ -137,6 +178,7 @@ Common actions:
 - The RPC client sends both `apptoken` and `apitoken` headers because shipped Cider builds vary.
 - Generic `search` uses `default_search_source` from config, which defaults to `catalog`.
 - Text requests go through the configured resolver backend. `fallback` only supports tiny direct commands like `play` and `pause`; `openai_compatible` sends chat-completions requests to a configurable OpenAI-style endpoint, including local endpoints such as Ollama when they expose the same API shape.
+- The intended A2A usage is text-first. Structured action payloads exist as an advanced path, but upstream conversational agents do not need to know them to use `cider_agent`.
 - Generic or descriptive `play` requests now start an adaptive long-form session instead of only picking one song. The service stores one active session, keeps a bounded recent-track history, and refills the Cider queue incrementally while the long-running server is running.
 - Artist-only or vibe-based requests are treated as adaptive sessions; specific track requests still resolve to one-shot playback.
 - Mid-session steering requests such as "more pop" or "more of this artist" update the active session and refill the queue against that new direction.

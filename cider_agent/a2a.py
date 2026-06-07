@@ -80,7 +80,7 @@ def build_agent_card() -> dict[str, Any]:
     return {
         "protocolVersion": "1.0.0",
         "name": "Cider Agent",
-        "description": "A dedicated audio control agent for the Cider Apple Music client.",
+        "description": "A dedicated music control agent for Cider. The intended interface is plain-language requests over A2A text messages.",
         "url": f"{settings.public_base_url}/a2a",
         "preferredTransport": "JSONRPC",
         "capabilities": {
@@ -92,40 +92,22 @@ def build_agent_card() -> dict[str, Any]:
         "defaultOutputModes": ["application/json", "text/plain"],
         "skills": [
             {
-                "id": "playback-control",
-                "name": "Playback Control",
-                "description": "Play, pause, seek, skip, and inspect current playback state in Cider.",
+                "id": "natural-language-music-control",
+                "name": "Natural-Language Music Control",
+                "description": "Send plain-language music requests like 'play upbeat morning music', 'more pop', or 'what's playing?'.",
                 "tags": ["audio", "playback", "music"],
-                "examples": ["Pause playback", "Skip to the next track", "Set volume to 35"],
-                "inputModes": ["text/plain", "application/json"],
+                "examples": ["Play upbeat morning music", "I don't like this", "Add some KATSEYE"],
+                "inputModes": ["text/plain"],
                 "outputModes": ["application/json", "text/plain"],
             },
             {
-                "id": "queue-management",
-                "name": "Queue Management",
-                "description": "Inspect and modify the Cider queue.",
-                "tags": ["queue", "playlist", "music"],
-                "examples": ["Show queue", "Remove queue item 3", "Move queue item 5 to 1"],
-                "inputModes": ["application/json"],
-                "outputModes": ["application/json"],
-            },
-            {
-                "id": "library-and-playlists",
-                "name": "Library and Playlists",
-                "description": "Search the Apple Music catalog and library, browse playlists, and create playlists.",
-                "tags": ["search", "library", "playlists", "apple-music"],
-                "examples": ["Search my library for k-pop", "Create playlist Late Night Mix", "Add tracks to playlist"],
+                "id": "advanced-structured-actions",
+                "name": "Advanced Structured Actions",
+                "description": "Structured action payloads are supported for advanced integrations, but most callers should use natural-language text requests instead.",
+                "tags": ["advanced", "structured", "integration"],
+                "examples": ["Status", "Search my library for k-pop", "Set volume to 35"],
                 "inputModes": ["application/json", "text/plain"],
                 "outputModes": ["application/json"],
-            },
-            {
-                "id": "preference-memory",
-                "name": "Preference Memory",
-                "description": "Store and retrieve explicit listening preferences for later recommendations.",
-                "tags": ["preferences", "recommendations", "memory"],
-                "examples": ["Remember that I like k-pop", "List my music preferences", "Play something I like"],
-                "inputModes": ["application/json", "text/plain"],
-                "outputModes": ["application/json", "text/plain"],
             },
         ],
     }
@@ -178,6 +160,8 @@ def _task_from_result(
     action: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
+    summary = payload.get("summary") if isinstance(payload, dict) else None
+    message_text = str(summary).strip() if isinstance(summary, str) and summary.strip() else f"Completed action '{action}'."
     return {
         "kind": "task",
         "id": task_id,
@@ -187,16 +171,16 @@ def _task_from_result(
             "timestamp": _iso_now(),
             "message": _message(
                 "agent",
-                [_text_part(f"Completed action '{action}'."), _data_part(payload)],
+                [_text_part(message_text), _data_part(payload)],
                 task_id=task_id,
             ),
         },
         "artifacts": [_artifact(payload)],
         "history": [
             request_message,
-            _message("agent", [_text_part(f"Completed action '{action}'."), _data_part(payload)], task_id=task_id),
+            _message("agent", [_text_part(message_text), _data_part(payload)], task_id=task_id),
         ],
-        "metadata": {"action": action},
+        "metadata": {"action": action, "summary": message_text},
     }
 
 

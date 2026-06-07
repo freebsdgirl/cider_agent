@@ -864,6 +864,7 @@ class CiderAgentService:
             }
             raise TextRequestExecutionError(str(exc), response) from exc
         response["execution"] = execution
+        response["summary"] = self._summarize_execution(execution)
         return response
 
     def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1371,6 +1372,45 @@ class CiderAgentService:
                 continue
             compact[key] = self._compact_output(item)
         return compact
+
+    def _summarize_execution(self, execution: dict[str, Any]) -> str:
+        action = str(execution.get("action", "")).strip()
+        result = execution.get("result", {})
+        if not isinstance(result, dict):
+            return action or "completed"
+        if action == "status":
+            playback = result.get("playback", {})
+            if isinstance(playback, dict):
+                track = playback.get("track", {})
+                if isinstance(track, dict) and track.get("title") and track.get("artist"):
+                    state = "playing" if playback.get("is_playing") else "paused"
+                    return f"{state}: {track['title']} by {track['artist']}"
+            return "status updated"
+        if action in {"play_session", "steer_session", "refill_session", "reject_current_track", "next_track"}:
+            payload = result.get("result", result)
+            if isinstance(payload, dict):
+                tracks = payload.get("tracks")
+                if isinstance(tracks, list) and tracks and isinstance(tracks[0], dict):
+                    title = tracks[0].get("title")
+                    artist = tracks[0].get("artist")
+                    if title and artist:
+                        return f"playing {title} by {artist}"
+                primary = payload.get("primary_track")
+                if isinstance(primary, dict) and primary.get("title") and primary.get("artist"):
+                    return f"playing {primary['title']} by {primary['artist']}"
+            return "session advanced"
+        if action in {"play", "pause", "playpause", "stop"}:
+            return action.replace("playpause", "toggled playback")
+        if action == "get_now_playing":
+            track = result.get("track", {})
+            if isinstance(track, dict) and track.get("title") and track.get("artist"):
+                return f"now playing {track['title']} by {track['artist']}"
+        if action in {"search", "search_catalog", "search_library", "search_catalog_tracks", "search_library_tracks"}:
+            count = result.get("count")
+            query = result.get("query")
+            if query is not None and count is not None:
+                return f"found {count} results for {query}"
+        return action or "completed"
 
     def _compact_track(self, track: dict[str, Any]) -> dict[str, Any]:
         compact: dict[str, Any] = {}

@@ -18,6 +18,7 @@ def test_execute_message_returns_completed_task(monkeypatch, service) -> None:
     assert task["kind"] == "task"
     assert task["status"]["state"] == "completed"
     assert task["metadata"]["action"] == "status"
+    assert "summary" in task["metadata"]
 
 
 def test_execute_text_message_uses_resolver(monkeypatch, service) -> None:
@@ -34,6 +35,7 @@ def test_execute_text_message_uses_resolver(monkeypatch, service) -> None:
 
     assert task["metadata"]["action"] == "search"
     assert task["metadata"]["resolver"] == "stub"
+    assert "summary" in task["metadata"]
 
 
 def test_agent_card_is_published(monkeypatch) -> None:
@@ -51,3 +53,5 @@ def test_agent_card_is_published(monkeypatch) -> None:
 
     assert payload["protocolVersion"] == "1.0.0"
     assert payload["url"] == "http://127.0.0.1:8766/a2a"
+    assert "plain-language requests" in payload["description"]
+    assert payload["skills"][0]["inputModes"] == ["text/plain"]
