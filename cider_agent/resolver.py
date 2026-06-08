@@ -148,7 +148,11 @@ class OpenAICompatibleResolver:
         if self._settings.resolver_api_key:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
 
-        body, content = self._complete_json(self._build_messages(text, service), headers)
+        messages = self._build_messages(text, service)
+        body, content = self._complete_json(messages, headers)
+        logger = getattr(service, "append_resolver_debug_log", None)
+        if callable(logger):
+            logger(stage="resolve_text_request", messages=messages, response_body=body, response_content=content)
         parsed = self._parse_json_object(content)
         action = str(parsed.get("action", "")).strip()
         parameters = parsed.get("parameters", {})
@@ -170,7 +174,11 @@ class OpenAICompatibleResolver:
         headers = {"Content-Type": "application/json"}
         if self._settings.resolver_api_key:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
-        body, content = self._complete_json(self._build_session_messages(request, service, session, count), headers)
+        messages = self._build_session_messages(request, service, session, count)
+        body, content = self._complete_json(messages, headers)
+        logger = getattr(service, "append_resolver_debug_log", None)
+        if callable(logger):
+            logger(stage="plan_session_query", messages=messages, response_body=body, response_content=content)
         parsed = self._parse_json_object(content)
         search_queries = self._normalize_candidate_queries(parsed.get("search_queries"))
         if not search_queries:
@@ -199,15 +207,18 @@ class OpenAICompatibleResolver:
         headers = {"Content-Type": "application/json"}
         if self._settings.resolver_api_key:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
-        body, content = self._complete_json(
-            self._build_session_selection_messages(request, service, session, search_query, candidates),
-            headers,
-        )
+        messages = self._build_session_selection_messages(request, service, session, search_query, candidates)
+        body, content = self._complete_json(messages, headers)
+        logger = getattr(service, "append_resolver_debug_log", None)
+        if callable(logger):
+            logger(stage="select_session_track", messages=messages, response_body=body, response_content=content)
         parsed = self._parse_json_object(content)
         selected_index = parsed.get("selected_index")
         if not isinstance(selected_index, int):
             selected_index = 0
-        if selected_index < 0 or selected_index >= len(candidates):
+        if selected_index < -1:
+            selected_index = -1
+        if selected_index >= len(candidates):
             selected_index = 0
         return SessionTrackSelection(
             selected_index=selected_index,
@@ -253,6 +264,10 @@ class OpenAICompatibleResolver:
                 "Positive steering like 'i like this artist', 'more like this', 'more pop', or 'more of this artist' should usually use steer_session and affect future picks rather than interrupting the current song.",
                 "Negative feedback about the current song should usually use reject_current_track and change the song now.",
                 "For play_session and steer_session, return a request string that can be persisted as session steering state.",
+                "For steer_session, you may also return search_update with shape {\"mode\": \"preserve\"|\"add\"|\"replace\", \"queries\": [string, ...]}.",
+                "Use search_update.mode='preserve' when steering should only affect post-search selection and should not change the session search query.",
+                "Use search_update.mode='add' only for additive or expansive steering that should broaden the search space, such as mixing in a new artist or genre.",
+                "Use search_update.mode='replace' only when the user is clearly changing the session direction enough that the old search query should be replaced.",
                 "If the user says something like 'more like this', 'more of this artist', or similar session steering, rewrite it into a concrete request using the current track and artist when possible.",
                 "Do not invent fake artists or track titles.",
                 "For play_session and steer_session, use the parameter name 'request'. Do not use 'request_text' or any alternate field names.",
@@ -283,9 +298,7 @@ class OpenAICompatibleResolver:
             "current_timestamp": service.current_timestamp(),
             "session_request": session.get("request_text"),
             "session_steering": session.get("steering_history", [])[-5:],
-            "recent_tracks": service.recent_session_tracks(limit=service.session_recent_tracks_limit()),
-            "global_recent_tracks": service.recent_global_tracks(limit=service.global_recent_tracks_limit()),
-            "playback_summary": service.session_planning_playback_snapshot(session),
+            "playback_summary": self._compact_session_playback_summary(service.session_planning_playback_snapshot(session)),
             "preferences": service.list_preferences()["preferences"][:5],
             "count": count,
         }
@@ -298,6 +311,9 @@ class OpenAICompatibleResolver:
             "Negative steering must continue to apply to future selections until explicitly overridden. "
             "Positive steering must continue to shape future selections until explicitly overridden. "
             "If the request is generic, you may adapt to time of day, such as higher energy in the morning and calmer music late at night. "
+            "If the user already asked for a specific genre, artist, era, or other concrete music descriptor, preserve that request broadly instead of narrowing it to a more specific sub-vibe, mood, or subset unless the user explicitly asked for that narrowing. "
+            "For example, a request like 'play trip-hop' should stay broad and should not be rewritten into a narrower variant like 'atmospheric trip hop' unless the user asked for atmospheric music. "
+            "Use more creative interpretation only when the request is open-ended, contextual, or activity-based, such as cleaning, studying, waking up, winding down, or hosting people. "
             "Do not guess final tracks from memory here; focus on the best Apple Music search string."
         )
         return [
@@ -317,11 +333,12 @@ class OpenAICompatibleResolver:
             "current_timestamp": service.current_timestamp(),
             "session_request": session.get("request_text"),
             "session_steering": session.get("steering_history", [])[-5:],
-            "recent_tracks": service.recent_session_tracks(limit=service.session_recent_tracks_limit()),
-            "global_recent_tracks": service.recent_global_tracks(limit=service.global_recent_tracks_limit()),
-            "playback_summary": service.session_planning_playback_snapshot(session),
+            "playback_summary": self._compact_session_playback_summary(service.session_planning_playback_snapshot(session)),
             "search_query": search_query,
-            "candidates": candidates[: self.MAX_SESSION_SELECTION_CANDIDATES],
+            "candidates": [
+                self._compact_session_selection_candidate(candidate)
+                for candidate in candidates[: self.MAX_SESSION_SELECTION_CANDIDATES]
+            ],
         }
         system = (
             "You are choosing the next track for an adaptive music session in cider_agent from real Apple Music results. "
@@ -330,12 +347,35 @@ class OpenAICompatibleResolver:
             "Treat session_steering as persistent cumulative session state, not a one-turn hint. "
             "Negative steering must continue to apply until explicitly overridden. "
             "Positive steering must continue to apply until explicitly overridden. "
-            "Prefer candidates that fit the session direction and avoid recent repeats."
+            "Prefer candidates that fit the session direction and avoid recent repeats. "
+            "If none of the shown candidates are suitable, return {\"selected_index\": -1}."
         )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nChoose the best candidate index for the next track."},
         ]
+
+    def _compact_session_selection_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        for key in ("id", "title", "artist", "album"):
+            value = candidate.get(key)
+            if value is not None:
+                compact[key] = value
+        return compact
+
+    def _compact_session_playback_summary(self, playback: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            "is_playing": playback.get("is_playing"),
+            "queue_length": playback.get("queue_length"),
+        }
+        track = playback.get("track", {})
+        if isinstance(track, dict):
+            compact["track"] = {
+                key: track.get(key)
+                for key in ("title", "artist", "album")
+                if key in track
+            }
+        return compact
 
     def _complete_json(self, messages: list[dict[str, str]], headers: dict[str, str]) -> tuple[dict[str, Any], str]:
         payload = {
@@ -468,6 +508,8 @@ class OpenAICompatibleResolver:
                 normalized["request"] = request.strip()
             elif original_text.strip():
                 normalized["request"] = original_text.strip()
+            if action == "steer_session":
+                normalized["search_update"] = self._normalize_search_update(normalized.get("search_update"))
             normalized.pop("request_text", None)
         return normalized
 
@@ -523,6 +565,28 @@ class OpenAICompatibleResolver:
         if not isinstance(value, list):
             return []
         return [self._normalize_query_text(str(item)) for item in value if str(item).strip()]
+
+    def _normalize_search_update(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"mode": "preserve", "queries": []}
+        mode = str(value.get("mode", "preserve")).strip().lower()
+        if mode not in {"preserve", "add", "replace"}:
+            mode = "preserve"
+        queries = self._normalize_candidate_queries(value.get("queries"))
+        deduped_queries: list[str] = []
+        seen: set[str] = set()
+        for query in queries:
+            lowered = query.casefold()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            deduped_queries.append(query)
+        queries = deduped_queries
+        if mode in {"add", "replace"} and not queries:
+            mode = "preserve"
+        if mode == "preserve":
+            queries = []
+        return {"mode": mode, "queries": queries}
 
 
 def build_resolver(settings: Settings) -> Resolver:

@@ -164,6 +164,59 @@ def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Setti
     assert resolved.parameters["query"] == "Pink"
 
 
+def test_openai_compatible_resolver_normalizes_structured_session_search_update(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class SearchUpdateTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "steer_session",
+                                    "parameters": {
+                                        "request": "add some radwimps",
+                                        "search_update": {
+                                            "mode": "add",
+                                            "queries": [" some radwimps ", "some radwimps"],
+                                        },
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=SearchUpdateTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("add some radwimps", service)
+
+    assert resolved.parameters["search_update"] == {"mode": "add", "queries": ["radwimps"]}
+
+
 def test_openai_compatible_resolver_includes_reasoning_when_enabled(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
@@ -346,7 +399,10 @@ def test_openai_compatible_resolver_can_steer_session_without_interrupting(setti
     resolved = resolver.resolve("i like this artist", service)
 
     assert resolved.action == "steer_session"
-    assert resolved.parameters == {"request": "more like Favorite Artist - Liked Song"}
+    assert resolved.parameters == {
+        "request": "more like Favorite Artist - Liked Song",
+        "search_update": {"mode": "preserve", "queries": []},
+    }
 
 
 def test_candidate_match_parameters_are_normalized(settings: Settings, service) -> None:
@@ -728,6 +784,106 @@ def test_select_session_track_returns_index_from_real_candidates(settings: Setti
     )
 
     assert selection.selected_index == 1
+
+
+def test_session_plan_prompt_omits_recent_track_history(settings: Settings, service) -> None:
+    captured_payload: dict[str, object] = {}
+
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class CapturePlanTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal captured_payload
+            captured_payload = json.loads(request.content.decode("utf-8"))
+            body = {"choices": [{"message": {"content": json.dumps({"search_queries": ["KATSEYE"]})}}]}
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=CapturePlanTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolver.plan_session("play some KATSEYE", service, {"request_text": "play some KATSEYE"}, 1)
+
+    prompt = captured_payload["messages"][1]["content"]
+    assert '"session_request"' in prompt
+    assert '"session_steering"' in prompt
+    assert '"recent_tracks"' not in prompt
+    assert '"global_recent_tracks"' not in prompt
+    system_prompt = captured_payload["messages"][0]["content"]
+    assert "preserve that request broadly" in system_prompt
+    assert "play trip-hop" in system_prompt
+    assert "Use more creative interpretation only when the request is open-ended" in system_prompt
+
+
+def test_session_selection_prompt_omits_recent_track_history(settings: Settings, service) -> None:
+    captured_payload: dict[str, object] = {}
+
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class CaptureSelectTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal captured_payload
+            captured_payload = json.loads(request.content.decode("utf-8"))
+            body = {"choices": [{"message": {"content": json.dumps({"selected_index": 0})}}]}
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=CaptureSelectTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolver.select_session_track(
+        "anime piano music",
+        service,
+        {"request_text": "anime piano music"},
+        "anime piano music",
+        [{"id": "a", "title": "One", "artist": "Artist A"}],
+    )
+
+    prompt = captured_payload["messages"][1]["content"]
+    assert '"search_query"' in prompt
+    assert '"recent_tracks"' not in prompt
+    assert '"global_recent_tracks"' not in prompt
+    assert '"duration_millis"' not in prompt
+    assert '"isrc"' not in prompt
+    assert '"artwork_url"' not in prompt
+    assert '"play_params"' not in prompt
+    assert '"raw"' not in prompt
+    assert '"title": "One"' in prompt
+    assert '"artist": "Artist A"' in prompt
 
 
 def test_play_session_request_text_is_normalized_to_request(settings: Settings, service) -> None:

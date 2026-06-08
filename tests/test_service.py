@@ -134,6 +134,65 @@ def test_handle_text_request_includes_timings_when_enabled(settings, service, tm
     assert "resolve_ms" in result["timings"]
     assert "execute_ms" in result["timings"]
     assert "total_ms" in result["timings"]
+    assert "execution" not in result["timings"]
+
+
+def test_handle_text_request_writes_resolver_debug_log(settings, service, tmp_path) -> None:
+    debug_log_path = tmp_path / "resolver-debug.log"
+    debug_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        resolver_debug_log_path=debug_log_path,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=settings.session_recent_tracks_limit,
+        global_recent_tracks_limit=settings.global_recent_tracks_limit,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "resolver-debug.db",
+        config_path=settings.config_path,
+    )
+
+    class LoggingResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            service.append_resolver_debug_log(
+                stage="resolve_text_request",
+                messages=[{"role": "user", "content": text}],
+                response_body={"ok": True},
+                response_content='{"action":"status","parameters":{}}',
+            )
+            return ResolvedAction(action="status", parameters={}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            raise AssertionError("plan_session should not be called in this test")
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            raise AssertionError("select_session_track should not be called in this test")
+
+    debug_service = CiderAgentService(
+        debug_settings,
+        rpc_client=service._rpc,
+        preference_store=PreferenceStore(debug_settings.database_path),
+        resolver=LoggingResolver(),
+    )
+
+    debug_service.handle_text_request("status")
+
+    log_text = debug_log_path.read_text(encoding="utf-8")
+    assert "reason: text-request: status" in log_text
+    assert "=== resolve_text_request ===" in log_text
+    assert '"content": "status"' in log_text
+    assert '{"action":"status","parameters":{}}' in log_text
 
 
 def test_handle_text_request_can_start_adaptive_session(service) -> None:
@@ -182,7 +241,7 @@ def test_adaptive_session_timing_debug_includes_selection_breakdown(settings, se
 
     result = timed_service.handle_text_request("it's morning - play something upbeat and with energy")
 
-    execution_timings = result["timings"]["execution"]
+    execution_timings = result["execution"]["result"]["result"]["timings"]
     assert "playback_snapshot_ms" in execution_timings
     assert "plan_session_ms" in execution_timings
     assert "collect_tracks_ms" in execution_timings
@@ -217,7 +276,7 @@ def test_collect_session_tracks_caps_search_work(settings, service, tmp_path) ->
         def playback_post(self, path: str, body=None):
             return {"path": path, "body": body}
 
-        def search_catalog(self, query: str, *, limit: int, storefront: str):
+        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
             self.search_queries.append(query)
             return {
                 "data": {
@@ -343,7 +402,7 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
     result = service._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
 
     assert result["selection_strategy"] == "adaptive-session-auto-advance"
-    assert result["tracks"][0]["title"] == "Another Song"
+    assert result["tracks"][0]["title"] == "Liked Song"
 
 
 def test_reject_current_track_advances_active_session_without_changing_vibe(service) -> None:
@@ -476,7 +535,7 @@ def test_new_session_avoids_recent_global_starter_track(settings, service, tmp_p
     assert second["result"]["tracks"][0]["title"] == "Another Song"
 
 
-def test_collect_session_tracks_relaxes_global_recent_exclusions_when_needed(settings, service, tmp_path) -> None:
+def test_new_query_pools_apply_global_recent_history_only_at_build_time(settings, service, tmp_path) -> None:
     class SameTrackResolver:
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
@@ -497,7 +556,7 @@ def test_collect_session_tracks_relaxes_global_recent_exclusions_when_needed(set
         def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
             return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
 
-    relaxed_settings = Settings(
+    pool_settings = Settings(
         http_host=settings.http_host,
         http_port=settings.http_port,
         public_base_url=settings.public_base_url,
@@ -517,35 +576,602 @@ def test_collect_session_tracks_relaxes_global_recent_exclusions_when_needed(set
         request_timeout_seconds=settings.request_timeout_seconds,
         verify_tls=settings.verify_tls,
         log_level=settings.log_level,
-        database_path=tmp_path / "relax-global-recent.db",
+        database_path=tmp_path / "global-recent-pool.db",
         config_path=settings.config_path,
     )
-    relaxed_service = CiderAgentService(
-        relaxed_settings,
+    pool_service = CiderAgentService(
+        pool_settings,
         rpc_client=service._rpc.__class__(),
-        preference_store=PreferenceStore(relaxed_settings.database_path),
+        preference_store=PreferenceStore(pool_settings.database_path),
         resolver=SameTrackResolver(),
     )
 
-    first = relaxed_service.play_session("play upbeat music")
+    first = pool_service.play_session("play upbeat music")
     assert first["result"]["tracks"][0]["title"] == "Liked Song"
-    relaxed_service.stop_session()
-    relaxed_service._rpc.current_track = None
+    pool_service.stop_session()
+    pool_service._rpc.current_track = None
 
     session = {"id": 999, "request_text": "play upbeat music", "steering_history": []}
-    plan = type(
-        "Plan",
-        (),
-        {
-            "search_queries": ["Favorite Artist Liked Song"],
+    built_pool = pool_service._build_session_query_pool(session, "Favorite Artist Liked Song")
+    assert [entry["track"]["title"] for entry in built_pool["entries"]] == ["Liked Song"]
+
+    preserved_pool = {
+        "Favorite Artist Liked Song": {
+            "search_query": "Favorite Artist Liked Song",
+            "cursor": 0,
+            "entries": [
+                {
+                    "track": service.search_catalog_tracks("Favorite Artist Liked Song", limit=1)["tracks"][0],
+                    "state": "fresh",
+                }
+            ],
+        }
+    }
+    pool_service._set_session_runtime(999, query_pools=preserved_pool, active_search_queries=["Favorite Artist Liked Song"])
+    window = pool_service._next_session_candidate_window(session, "Favorite Artist Liked Song")
+
+    assert [entry["track"]["title"] for entry in window] == ["Liked Song"]
+
+
+def test_new_query_pool_relaxes_global_recent_filter_when_it_would_be_empty(settings, service, tmp_path) -> None:
+    class SameTrackResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": ["Favorite Artist Liked Song"],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    pool_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=5,
+        global_recent_tracks_limit=10,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "global-recent-relax.db",
+        config_path=settings.config_path,
+    )
+    pool_service = CiderAgentService(
+        pool_settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(pool_settings.database_path),
+        resolver=SameTrackResolver(),
+    )
+
+    first = pool_service.play_session("play upbeat music")
+    assert first["result"]["tracks"][0]["title"] == "Liked Song"
+    pool_service.stop_session()
+    pool_service._rpc.current_track = None
+
+    session = {"id": 999, "request_text": "play upbeat music", "steering_history": []}
+    built_pool = pool_service._build_session_query_pool(session, "Favorite Artist Liked Song")
+
+    assert [entry["track"]["title"] for entry in built_pool["entries"]] == ["Liked Song"]
+
+
+def test_session_search_cache_reuses_large_result_pool_without_requerying(service) -> None:
+    class WindowRejectingResolver:
+        def __init__(self) -> None:
+            self.windows: list[list[str]] = []
+
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": ["Favorite Artist Wide Pool"],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(
+            self,
+            request: str,
+            service,
+            session: dict[str, object],
+            search_query: str,
+            candidates: list[dict[str, object]],
+        ):
+            self.windows.append([str(candidate.get("title")) for candidate in candidates])
+            if candidates and candidates[0].get("title") == "Wide Song 1":
+                return type("Selection", (), {"selected_index": -1, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    service._resolver = WindowRejectingResolver()
+    session = service._preferences.start_session(request_text="play upbeat music")
+
+    result = service._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
+
+    assert result["tracks"][0]["title"] == "Wide Song 7"
+    assert len(service._rpc.search_catalog_calls) == 1
+    assert service._resolver.windows == [
+        [f"Wide Song {index}" for index in range(1, 7)],
+        ["Wide Song 7", "Wide Song 8"],
+    ]
+    runtime = service._get_session_runtime(session["id"])
+    pool = runtime["query_pools"]["Favorite Artist Wide Pool"]
+    assert [entry["state"] for entry in pool["entries"][:6]] == ["screened_out"] * 6
+    assert pool["cursor"] == 0
+
+
+def test_session_query_pool_fetches_100_results_as_two_paginated_calls(settings, tmp_path) -> None:
+    class PaginatedRpcClient:
+        def __init__(self) -> None:
+            self.search_calls: list[dict[str, int]] = []
+
+        def close(self) -> None:
+            return None
+
+        def playback_get(self, path: str):
+            if path == "/now-playing":
+                return {"info": {}}
+            if path == "/queue":
+                return []
+            if path == "/is-playing":
+                return {"status": "ok", "is_playing": False}
+            if path == "/volume":
+                return {"volume": 0.5}
+            if path == "/repeat-mode":
+                return {"value": 0}
+            if path == "/shuffle-mode":
+                return {"value": 0}
+            if path == "/autoplay":
+                return {"value": False}
+            return {"value": True}
+
+        def playback_post(self, path: str, body=None):
+            return {"path": path, "body": body}
+
+        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+            self.search_calls.append({"limit": limit, "offset": offset})
+            songs = [
+                {
+                    "id": f"page-track-{offset + index + 1}",
+                    "type": "songs",
+                    "attributes": {
+                        "name": f"Page Song {offset + index + 1}",
+                        "artistName": "Paged Artist",
+                        "albumName": "Paged Album",
+                        "playParams": {
+                            "id": f"page-track-{offset + index + 1}",
+                            "kind": "songs",
+                            "isLibrary": False,
+                        },
+                    },
+                }
+                for index in range(limit)
+            ]
+            return {"data": {"results": {"songs": {"data": songs}}}}
+
+        def search_library(self, query: str, *, limit: int, types: list[str] | None = None):
+            return {"data": {"results": {}}}
+
+        def run_amapi_v3(self, path: str, *, method: str = "GET", body: dict[str, object] | None = None):
+            return {"data": {"data": []}}
+
+    class FixedResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": ["trip hop essentials"],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    rpc = PaginatedRpcClient()
+    paged_service = CiderAgentService(
+        settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(tmp_path / "paged-limit.db"),
+        resolver=FixedResolver(),
+    )
+
+    result = paged_service.play_session("play trip-hop")
+
+    assert result["result"]["tracks"][0]["title"] == "Page Song 1"
+    assert rpc.search_calls == [{"limit": 50, "offset": 0}, {"limit": 50, "offset": 50}]
+
+
+def test_session_query_pool_resets_screened_out_before_played(service) -> None:
+    service._set_session_runtime(
+        77,
+        query_pools={
+            "pool": {
+                "search_query": "pool",
+                "cursor": 0,
+                "entries": [
+                    {"track": {"id": "a", "title": "A"}, "state": "screened_out"},
+                    {"track": {"id": "b", "title": "B"}, "state": "played"},
+                    {"track": {"id": "c", "title": "C"}, "state": "rejected"},
+                ],
+            }
         },
-    )()
-    timings: dict[str, object] = {}
+    )
+    session = {"id": 77, "request_text": "play upbeat music", "steering_history": []}
 
-    tracks, _, _ = relaxed_service._collect_session_tracks(session, plan, limit=1, timings=timings)
+    first_window = service._next_session_candidate_window(session, "pool")
+    runtime_after_first = service._get_session_runtime(77)
 
-    assert tracks[0]["title"] == "Liked Song"
-    assert timings["relaxed_global_recent_exclusions"] is True
+    assert [entry["track"]["title"] for entry in first_window] == ["A"]
+    assert runtime_after_first["query_pools"]["pool"]["entries"][0]["state"] == "fresh"
+    assert runtime_after_first["query_pools"]["pool"]["entries"][1]["state"] == "played"
+    assert runtime_after_first["query_pools"]["pool"]["entries"][2]["state"] == "rejected"
+
+
+def test_session_query_pool_resets_played_after_full_exhaustion(service) -> None:
+    service._set_session_runtime(
+        78,
+        query_pools={
+            "pool": {
+                "search_query": "pool",
+                "cursor": 0,
+                "entries": [
+                    {"track": {"id": "a", "title": "A"}, "state": "played"},
+                    {"track": {"id": "b", "title": "B"}, "state": "played"},
+                    {"track": {"id": "c", "title": "C"}, "state": "rejected"},
+                ],
+            }
+        },
+    )
+    session = {"id": 78, "request_text": "play upbeat music", "steering_history": []}
+
+    window = service._next_session_candidate_window(session, "pool")
+    runtime = service._get_session_runtime(78)
+
+    assert [entry["track"]["title"] for entry in window] == ["A", "B"]
+    assert runtime["query_pools"]["pool"]["entries"][0]["state"] == "fresh"
+    assert runtime["query_pools"]["pool"]["entries"][1]["state"] == "fresh"
+    assert runtime["query_pools"]["pool"]["entries"][2]["state"] == "rejected"
+
+
+def test_reject_current_track_marks_cached_entry_rejected_across_passes(service) -> None:
+    class FixedPoolResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": ["Favorite Artist Wide Pool"],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    service._resolver = FixedPoolResolver()
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    rejected_track_id = service.playback_snapshot()["track"]["track_id"]
+    service.reject_current_track()
+
+    runtime = service._get_session_runtime(session["id"])
+    pool = runtime["query_pools"]["Favorite Artist Wide Pool"]
+    rejected_entry = next(entry for entry in pool["entries"] if entry["track"]["id"] == rejected_track_id)
+
+    assert rejected_entry["state"] == "rejected"
+
+
+def test_resolver_debug_log_resets_between_track_selection_episodes(settings, service, tmp_path) -> None:
+    debug_log_path = tmp_path / "episode-debug.log"
+    debug_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        resolver_debug_log_path=debug_log_path,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=settings.session_recent_tracks_limit,
+        global_recent_tracks_limit=settings.global_recent_tracks_limit,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "episode-debug.db",
+        config_path=settings.config_path,
+    )
+
+    class EpisodeLoggingResolver:
+        def __init__(self) -> None:
+            self.plan_calls = 0
+
+        def resolve(self, text: str, service) -> ResolvedAction:
+            raise AssertionError("resolve should not be called in this test")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            self.plan_calls += 1
+            label = "Favorite Artist Liked Song" if self.plan_calls == 1 else "Favorite Artist Another Song"
+            marker = f"query-{self.plan_calls}"
+            service.append_resolver_debug_log(
+                stage="plan_session_query",
+                messages=[{"role": "user", "content": marker}],
+                response_body={"search_queries": [label], "marker": marker},
+                response_content=label,
+            )
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": [label],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            service.append_resolver_debug_log(
+                stage="select_session_track",
+                messages=[{"role": "user", "content": search_query}],
+                response_body={"selected_index": 0},
+                response_content='{"selected_index":0}',
+            )
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    debug_service = CiderAgentService(
+        debug_settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(debug_settings.database_path),
+        resolver=EpisodeLoggingResolver(),
+    )
+
+    debug_service.play_session("play upbeat music")
+    first_log = debug_log_path.read_text(encoding="utf-8")
+    assert "query-1" in first_log
+
+    debug_service.next_track()
+    second_log = debug_log_path.read_text(encoding="utf-8")
+    assert "reason: adaptive-session-skip" in second_log
+    assert "query-2" in second_log
+    assert "query-1" not in second_log
+
+
+def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp_path) -> None:
+    debug_log_path = tmp_path / "auto-advance-debug.log"
+    debug_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        resolver_debug_log_path=debug_log_path,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=settings.session_recent_tracks_limit,
+        global_recent_tracks_limit=settings.global_recent_tracks_limit,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "auto-advance-debug.db",
+        config_path=settings.config_path,
+    )
+
+    class EpisodeLoggingResolver:
+        def __init__(self) -> None:
+            self.plan_calls = 0
+
+        def resolve(self, text: str, service) -> ResolvedAction:
+            raise AssertionError("resolve should not be called in this test")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            self.plan_calls += 1
+            marker = f"auto-query-{self.plan_calls}"
+            query = "Favorite Artist Liked Song" if self.plan_calls == 1 else "Favorite Artist Another Song"
+            service.append_resolver_debug_log(
+                stage="plan_session_query",
+                messages=[{"role": "user", "content": marker}],
+                response_body={"search_queries": [query], "marker": marker},
+                response_content=query,
+            )
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": [query],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            service.append_resolver_debug_log(
+                stage="select_session_track",
+                messages=[{"role": "user", "content": search_query}],
+                response_body={"selected_index": 0},
+                response_content='{"selected_index":0}',
+            )
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    debug_service = CiderAgentService(
+        debug_settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(debug_settings.database_path),
+        resolver=EpisodeLoggingResolver(),
+    )
+
+    debug_service.play_session("play upbeat music")
+    first_log = debug_log_path.read_text(encoding="utf-8")
+    assert "reason: adaptive-session-start: play upbeat music" in first_log
+    assert "auto-query-1" in first_log
+
+    active = debug_service._preferences.get_active_session()
+    assert active is not None
+    debug_service._play_session_track_with_debug_episode(
+        active,
+        selection_strategy="adaptive-session-auto-advance",
+        debug_reason="adaptive-session-auto-advance",
+    )
+
+    second_log = debug_log_path.read_text(encoding="utf-8")
+    assert "reason: adaptive-session-auto-advance" in second_log
+    assert "auto-query-2" in second_log
+    assert "auto-query-1" not in second_log
+
+
+def test_preserve_steering_keeps_session_query_pools(service) -> None:
+    class CacheFillingResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": ["Favorite Artist Wide Pool"],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    service._resolver = CacheFillingResolver()
+    started = service.play_session("play upbeat music")
+    session = started["session"]
+    runtime = service._get_session_runtime(session["id"])
+    assert "Favorite Artist Wide Pool" in runtime["query_pools"]
+    original_pool = runtime["query_pools"]["Favorite Artist Wide Pool"]
+
+    service.steer_session("prefer female vocalists")
+
+    runtime = service._get_session_runtime(session["id"])
+    assert runtime["query_pools"]["Favorite Artist Wide Pool"] == original_pool
+
+
+def test_replace_steering_rebuilds_session_query_pools(service) -> None:
+    class CacheFillingResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": ["Favorite Artist Wide Pool"],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    service._resolver = CacheFillingResolver()
+    started = service.play_session("play upbeat music")
+    session = started["session"]
+    runtime = service._get_session_runtime(session["id"])
+    assert "Favorite Artist Wide Pool" in runtime["query_pools"]
+
+    service.steer_session("switch to dream pop", search_update={"mode": "replace", "queries": ["dream pop"]})
+
+    runtime = service._get_session_runtime(session["id"])
+    assert runtime["active_search_queries"] == ["dream pop"]
+    assert list(runtime["query_pools"]) == ["dream pop"]
+
+
+def test_additive_steering_appends_session_search_query(service) -> None:
+    class CacheFillingResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "search_queries": ["trip hop"],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+
+    service._resolver = CacheFillingResolver()
+    started = service.play_session("play trip hop")
+    session = started["session"]
+
+    service.steer_session("add some radwimps", search_update={"mode": "add", "queries": ["RADWIMPS"]})
+
+    runtime = service._get_session_runtime(session["id"])
+    assert runtime["active_search_queries"] == ["trip hop", "RADWIMPS"]
+    assert list(runtime["query_pools"]) == ["trip hop", "RADWIMPS"]
 
 
 def test_top_pool_order_randomizes_within_small_high_confidence_bucket(service) -> None:
@@ -604,7 +1230,7 @@ def test_session_planning_reuses_cached_playback_snapshot(settings, tmp_path) ->
         def playback_post(self, path: str, body=None):
             return {"path": path, "body": body}
 
-        def search_catalog(self, query: str, *, limit: int, storefront: str):
+        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
             return {
                 "data": {
                     "results": {
@@ -812,7 +1438,7 @@ def test_collect_session_tracks_uses_track_artist_as_fallback_artist(settings, s
         def playback_post(self, path: str, body=None):
             return {"path": path, "body": body}
 
-        def search_catalog(self, query: str, *, limit: int, storefront: str):
+        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
             if query == "RADWIMPS Nandemonaiya (Piano Version)":
                 return {"data": {"results": {"songs": {"data": []}}}}
             if query == "RADWIMPS":
@@ -943,7 +1569,7 @@ def test_collect_session_tracks_uses_real_query_results(settings, service, tmp_p
         def playback_post(self, path: str, body=None):
             return {"path": path, "body": body}
 
-        def search_catalog(self, query: str, *, limit: int, storefront: str):
+        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
             if query == "RADWIMPS Nandemonaiya (Piano Version)":
                 return {"data": {"results": {"songs": {"data": []}}}}
             if query == "RADWIMPS":

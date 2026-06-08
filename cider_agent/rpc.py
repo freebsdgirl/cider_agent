@@ -45,9 +45,12 @@ class CiderRpcClient:
             payload["body"] = body
         return self._request("POST", "/api/v1/amapi/run-v3", json_body=payload)
 
-    def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us") -> Any:
+    def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> Any:
         encoded_query = quote(query, safe="")
-        return self.run_amapi_v3(f"/v1/catalog/{storefront}/search?term={encoded_query}&types=songs&limit={limit}")
+        path = f"/v1/catalog/{storefront}/search?term={encoded_query}&types=songs&limit={limit}"
+        if offset:
+            path = f"{path}&offset={offset}"
+        return self.run_amapi_v3(path)
 
     def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None) -> Any:
         encoded_query = quote(query, safe="")

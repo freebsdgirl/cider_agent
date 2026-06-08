@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import logging
 from dataclasses import dataclass
+import json
 import random
 import threading
 import time
@@ -207,7 +208,9 @@ class CiderAgentService:
     SESSION_REFILL_INTERVAL_SECONDS = 5.0
     SESSION_ADVANCE_COOLDOWN_SECONDS = 5.0
     TRACK_SELECTION_POOL_SIZE = 3
-    SESSION_SEARCH_RESULT_LIMIT = 6
+    SESSION_SEARCH_RESULT_LIMIT = 100
+    SESSION_SEARCH_PAGE_LIMIT = 50
+    SESSION_SELECTION_WINDOW_SIZE = 6
 
     def __init__(
         self,
@@ -227,6 +230,8 @@ class CiderAgentService:
         self._session_worker_stop = threading.Event()
         self._session_worker_lock = threading.Lock()
         self._session_runtime_lock = threading.Lock()
+        self._resolver_debug_log_lock = threading.Lock()
+        self._resolver_debug_episode_depth = 0
         self._session_runtime: dict[int, dict[str, Any]] = {}
         self._session_advance_lock = threading.Lock()
         self._random = random.SystemRandom()
@@ -247,6 +252,9 @@ class CiderAgentService:
 
     def include_timing_debug(self) -> bool:
         return self._settings.include_timing_debug
+
+    def resolver_debug_log_path(self):
+        return self._settings.resolver_debug_log_path
 
     def session_recent_tracks_limit(self) -> int:
         return self._settings.session_recent_tracks_limit
@@ -413,7 +421,11 @@ class CiderAgentService:
                 return {"status": "ok", "result": self._rpc.playback_post("/play")}
             if _clean_id(snapshot.get("track", {}).get("track_id")):
                 return {"status": "ok", "result": self._rpc.playback_post("/play")}
-            return self._play_session_track(session, selection_strategy="adaptive-session-resume")
+            started_debug_episode = self._begin_resolver_debug_episode("adaptive-session-resume")
+            try:
+                return self._play_session_track(session, selection_strategy="adaptive-session-resume")
+            finally:
+                self._end_resolver_debug_episode(started_debug_episode)
         return {"status": "ok", "result": self._rpc.playback_post("/play")}
 
     def pause(self) -> dict[str, Any]:
@@ -439,7 +451,11 @@ class CiderAgentService:
         if session is not None:
             self._set_session_runtime(session["id"], suspended=False)
             self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
-            return self._play_session_track(session, selection_strategy="adaptive-session-skip")
+            return self._play_session_track_with_debug_episode(
+                session,
+                selection_strategy="adaptive-session-skip",
+                debug_reason="adaptive-session-skip",
+            )
         return {"status": "ok", "result": self._rpc.playback_post("/next")}
 
     def previous_track(self) -> dict[str, Any]:
@@ -535,21 +551,24 @@ class CiderAgentService:
             raise CiderValidationError("href cannot be empty.")
         return {"status": "ok", "result": self._rpc.playback_post("/play-item-href", {"href": href})}
 
-    def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us") -> dict[str, Any]:
-        self._validate_search(query, limit)
-        payload = self._rpc.search_catalog(query=query, limit=limit, storefront=storefront)
+    def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
+        self._validate_limit_offset(limit, offset)
+        if not query.strip():
+            raise CiderValidationError("query cannot be empty.")
+        payload = self._rpc.search_catalog(query=query, limit=limit, storefront=storefront, offset=offset)
         items = payload.get("data", {}).get("results", {}).get("songs", {}).get("data", [])
         return {
             "status": "ok",
             "query": query,
             "storefront": storefront,
+            "offset": offset,
             "count": len(items) if isinstance(items, list) else 0,
             "tracks": [_flatten_track_item(item) for item in items] if isinstance(items, list) else [],
             "raw": payload,
         }
 
-    def search_catalog_tracks(self, query: str, *, limit: int = 10, storefront: str = "us") -> dict[str, Any]:
-        return self.search_catalog(query, limit=limit, storefront=storefront)
+    def search_catalog_tracks(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
+        return self.search_catalog(query, limit=limit, storefront=storefront, offset=offset)
 
     def search(self, query: str, *, limit: int = 10, storefront: str = "us") -> dict[str, Any]:
         if self.default_search_source() == "library":
@@ -819,11 +838,15 @@ class CiderAgentService:
             raise CiderValidationError("request cannot be empty.")
         session = self._preferences.start_session(request_text=request.strip())
         self._clear_all_session_runtime()
-        self._set_session_runtime(session["id"], suspended=False)
+        self._set_session_runtime(session["id"], suspended=False, active_search_queries=[], query_pools={})
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="starting")
         self._preferences.add_session_event(session["id"], event_type="session_started", metadata={"request": request.strip()})
         try:
-            result = self._play_session_track(session, selection_strategy="adaptive-session-start")
+            result = self._play_session_track_with_debug_episode(
+                session,
+                selection_strategy="adaptive-session-start",
+                debug_reason=f"adaptive-session-start: {request.strip()}",
+            )
         except Exception:
             self._abort_failed_session_start(session["id"])
             raise
@@ -834,16 +857,30 @@ class CiderAgentService:
             "result": result,
         }
 
-    def steer_session(self, request: str) -> dict[str, Any]:
+    def steer_session(self, request: str, *, search_update: dict[str, Any] | None = None) -> dict[str, Any]:
         if not request.strip():
             raise CiderValidationError("request cannot be empty.")
         session = self._preferences.get_active_session()
         if session is None:
             raise CiderValidationError("No active session is running.")
         session = self._preferences.add_session_steering(session["id"], request.strip())
-        self._set_session_runtime(session["id"], suspended=False)
+        runtime = self._get_session_runtime(session["id"])
+        resolved_search_update = self._normalize_session_search_update(search_update)
+        next_queries = self._next_session_search_queries(runtime, resolved_search_update)
+        current_queries = list(runtime.get("active_search_queries", []))
+        self._set_session_runtime(session["id"], suspended=False, active_search_queries=next_queries)
+        if resolved_search_update["mode"] == "replace" and next_queries != current_queries:
+            self._replace_session_query_pools(session, next_queries)
+        elif resolved_search_update["mode"] == "add":
+            added_queries = [query for query in next_queries if query not in current_queries]
+            if added_queries:
+                self._ensure_session_query_pools(session, added_queries)
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
-        self._preferences.add_session_event(session["id"], event_type="session_steered", metadata={"request": request.strip()})
+        self._preferences.add_session_event(
+            session["id"],
+            event_type="session_steered",
+            metadata={"request": request.strip(), "search_update": resolved_search_update},
+        )
         playback = self.playback_snapshot()
         result = {
             "status": "ok",
@@ -851,6 +888,7 @@ class CiderAgentService:
             "playback": playback,
             "tracks": [],
             "deferred_until_next_track": True,
+            "search_update": resolved_search_update,
         }
         return {
             "status": "ok",
@@ -866,7 +904,11 @@ class CiderAgentService:
         self._set_session_runtime(session["id"], suspended=False)
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
         self._preferences.add_session_event(session["id"], event_type="session_manual_advance")
-        result = self._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
+        result = self._play_session_track_with_debug_episode(
+            session,
+            selection_strategy="adaptive-session-manual-advance",
+            debug_reason="adaptive-session-manual-advance",
+        )
         return {
             "status": "ok",
             "mode": "adaptive-session",
@@ -882,6 +924,7 @@ class CiderAgentService:
         current = playback.get("track", {})
         current_id = _clean_id(current.get("track_id"))
         if current_id:
+            self._mark_session_track_rejected(session["id"], current_id)
             self._preferences.add_session_event(
                 session["id"],
                 event_type="track_rejected",
@@ -895,7 +938,11 @@ class CiderAgentService:
             )
         self._set_session_runtime(session["id"], suspended=False)
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
-        result = self._play_session_track(session, selection_strategy="adaptive-session-reject-current")
+        result = self._play_session_track_with_debug_episode(
+            session,
+            selection_strategy="adaptive-session-reject-current",
+            debug_reason="adaptive-session-reject-current",
+        )
         return {
             "status": "ok",
             "mode": "adaptive-session",
@@ -964,16 +1011,39 @@ class CiderAgentService:
         return self._resolver.resolve(text, self)
 
     def execute_text_request(self, text: str) -> TextRequestResult:
-        started_at = time.perf_counter()
-        resolve_started_at = time.perf_counter()
-        resolved = self.resolve_text_request(text)
-        resolve_ms = _elapsed_ms(resolve_started_at)
-        resolved_action = self._compact_resolved_action(resolved.action, resolved.parameters)
-        execute_started_at = time.perf_counter()
         try:
-            execution = self.execute_action(resolved.action, resolved.parameters)
-        except CiderAgentError as exc:
-            error = {"type": exc.__class__.__name__, "message": str(exc)}
+            started_debug_episode = self._begin_resolver_debug_episode(f"text-request: {text.strip()}")
+            started_at = time.perf_counter()
+            resolve_started_at = time.perf_counter()
+            resolved = self.resolve_text_request(text)
+            resolve_ms = _elapsed_ms(resolve_started_at)
+            resolved_action = self._compact_resolved_action(resolved.action, resolved.parameters)
+            execute_started_at = time.perf_counter()
+            try:
+                execution = self.execute_action(resolved.action, resolved.parameters)
+            except CiderAgentError as exc:
+                error = {"type": exc.__class__.__name__, "message": str(exc)}
+                timings = None
+                if self.include_timing_debug():
+                    timings = {
+                        "resolve_ms": resolve_ms,
+                        "execute_ms": _elapsed_ms(execute_started_at),
+                        "total_ms": _elapsed_ms(started_at),
+                    }
+                failure = TextRequestResult(
+                    status="error",
+                    input=text,
+                    resolver=resolved.resolver,
+                    resolved_action=resolved_action,
+                    execution=EngineActionResult(action=resolved.action, result={}),
+                    reasoning=resolved.reasoning,
+                    resolver_raw_content=resolved.raw_content,
+                    resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
+                    timings=timings,
+                    error=error,
+                )
+                raise TextRequestExecutionError(str(exc), failure.as_dict()) from exc
+            summary = self._summarize_execution(execution.as_dict())
             timings = None
             if self.include_timing_debug():
                 timings = {
@@ -981,41 +1051,19 @@ class CiderAgentService:
                     "execute_ms": _elapsed_ms(execute_started_at),
                     "total_ms": _elapsed_ms(started_at),
                 }
-            failure = TextRequestResult(
-                status="error",
+            return TextRequestResult(
                 input=text,
                 resolver=resolved.resolver,
                 resolved_action=resolved_action,
-                execution=EngineActionResult(action=resolved.action, result={}),
+                execution=execution,
+                summary=summary,
                 reasoning=resolved.reasoning,
                 resolver_raw_content=resolved.raw_content,
                 resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
                 timings=timings,
-                error=error,
             )
-            raise TextRequestExecutionError(str(exc), failure.as_dict()) from exc
-        summary = self._summarize_execution(execution.as_dict())
-        timings = None
-        if self.include_timing_debug():
-            timings = {
-                "resolve_ms": resolve_ms,
-                "execute_ms": _elapsed_ms(execute_started_at),
-                "total_ms": _elapsed_ms(started_at),
-            }
-            execution_timings = self._extract_execution_timings(execution.as_dict())
-            if isinstance(execution_timings, dict):
-                timings["execution"] = execution_timings
-        return TextRequestResult(
-            input=text,
-            resolver=resolved.resolver,
-            resolved_action=resolved_action,
-            execution=execution,
-            summary=summary,
-            reasoning=resolved.reasoning,
-            resolver_raw_content=resolved.raw_content,
-            resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
-            timings=timings,
-        )
+        finally:
+            self._end_resolver_debug_episode(locals().get("started_debug_episode", False))
 
     def handle_text_request(self, text: str) -> dict[str, Any]:
         return self.execute_text_request(text).as_dict()
@@ -1043,9 +1091,28 @@ class CiderAgentService:
                 playback = self.playback_snapshot()
                 self._record_current_track_for_session(session, playback=playback)
                 if self._should_advance_session(session, playback):
-                    self._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
+                    self._play_session_track_with_debug_episode(
+                        session,
+                        selection_strategy="adaptive-session-auto-advance",
+                        debug_reason="adaptive-session-auto-advance",
+                    )
+            except CiderValidationError as exc:
+                LOGGER.warning("Adaptive session worker could not advance session: %s", exc)
             except Exception:
                 LOGGER.exception("Adaptive session worker failed during refill loop.")
+
+    def _play_session_track_with_debug_episode(
+        self,
+        session: dict[str, Any],
+        *,
+        selection_strategy: str,
+        debug_reason: str,
+    ) -> dict[str, Any]:
+        started_debug_episode = self._begin_resolver_debug_episode(debug_reason)
+        try:
+            return self._play_session_track(session, selection_strategy=selection_strategy)
+        finally:
+            self._end_resolver_debug_episode(started_debug_episode)
 
     def _play_session_track(self, session: dict[str, Any], *, selection_strategy: str) -> dict[str, Any]:
         with self._session_advance_lock:
@@ -1071,6 +1138,13 @@ class CiderAgentService:
                 timings["plan_session_ms"] = _elapsed_ms(planning_started_at)
                 collect_started_at = time.perf_counter()
                 tracks, search_query, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                if not tracks and getattr(plan, "resolver", "") == "session-runtime":
+                    replan_started_at = time.perf_counter()
+                    plan = self._plan_session_query(session, count=1, force_replan=True)
+                    timings["replan_session_ms"] = _elapsed_ms(replan_started_at)
+                    collect_retry_started_at = time.perf_counter()
+                    tracks, search_query, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                    timings["collect_retry_ms"] = _elapsed_ms(collect_retry_started_at)
                 timings["collect_tracks_ms"] = _elapsed_ms(collect_started_at)
                 if not tracks:
                     raise CiderValidationError("No playable candidate match could be resolved.")
@@ -1123,12 +1197,21 @@ class CiderAgentService:
                 self._set_session_runtime(session["id"], advance_in_progress=False, planning_playback_snapshot=None)
                 raise
 
-    def _plan_session_query(self, session: dict[str, Any], *, count: int) -> SessionQueryPlan:
+    def _plan_session_query(self, session: dict[str, Any], *, count: int, force_replan: bool = False) -> SessionQueryPlan:
+        runtime = self._get_session_runtime(session["id"])
+        active_queries = self._normalize_search_queries(runtime.get("active_search_queries"))
+        if active_queries and not force_replan:
+            self._ensure_session_query_pools(session, active_queries)
+            return SessionQueryPlan(search_queries=active_queries[:count] or active_queries, resolver="session-runtime")
         planner = getattr(self._resolver, "plan_session", None)
         if not callable(planner):
             raise CiderValidationError("The configured resolver does not support adaptive play sessions.")
         request = self._session_effective_request(session)
-        return planner(request, self, session, count)
+        plan = planner(request, self, session, count)
+        resolved_queries = self._normalize_search_queries(getattr(plan, "search_queries", []))
+        if resolved_queries:
+            self._set_session_runtime(session["id"], active_search_queries=resolved_queries, query_pools={})
+        return plan
 
     def _session_effective_request(self, session: dict[str, Any]) -> str:
         steering = session.get("steering_history", [])
@@ -1147,25 +1230,7 @@ class CiderAgentService:
         limit: int,
         timings: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], str, SessionTrackSelection]:
-        excluded_ids = self._session_excluded_track_ids(session, include_global=True)
-        chosen, search_query, selection = self._collect_session_tracks_with_exclusions(
-            session,
-            plan,
-            limit=limit,
-            excluded_ids=excluded_ids,
-        )
-
-        if not chosen and self.global_recent_tracks_limit() > 0 and search_query:
-            relaxed_excluded_ids = self._session_excluded_track_ids(session, include_global=False)
-            chosen, search_query, selection = self._collect_session_tracks_with_exclusions(
-                session,
-                plan,
-                limit=limit,
-                excluded_ids=relaxed_excluded_ids,
-            )
-            if timings is not None and self.include_timing_debug():
-                timings["relaxed_global_recent_exclusions"] = True
-                timings["excluded_track_count_after_relaxation"] = len(relaxed_excluded_ids)
+        chosen, search_query, selection = self._collect_session_tracks_from_pools(session, plan, limit=limit)
 
         if timings is not None and self.include_timing_debug():
             timings["candidate_track_search_count"] = getattr(self, "_debug_candidate_track_search_count", 0)
@@ -1174,19 +1239,20 @@ class CiderAgentService:
             timings["candidate_artist_search_ms"] = round(getattr(self, "_debug_candidate_artist_search_ms", 0.0), 2)
             timings["candidate_query_search_count"] = getattr(self, "_debug_candidate_query_search_count", 0)
             timings["candidate_query_search_ms"] = round(getattr(self, "_debug_candidate_query_search_ms", 0.0), 2)
-            timings["excluded_track_count"] = len(excluded_ids)
             timings["selected_track_count"] = len(chosen)
             timings["selection_candidate_count"] = getattr(self, "_debug_selection_candidate_count", 0)
+            timings["query_pool_count"] = len(
+                self._normalize_session_query_pools(self._get_session_runtime(session["id"]).get("query_pools"))
+            )
 
         return chosen, search_query, selection
 
-    def _collect_session_tracks_with_exclusions(
+    def _collect_session_tracks_from_pools(
         self,
         session: dict[str, Any],
         plan: SessionQueryPlan,
         *,
         limit: int,
-        excluded_ids: set[str],
     ) -> tuple[list[dict[str, Any]], str, SessionTrackSelection]:
         self._debug_candidate_track_search_count = 0
         self._debug_candidate_track_search_ms = 0.0
@@ -1204,19 +1270,71 @@ class CiderAgentService:
             if not query_text:
                 continue
             last_query = query_text
-            search_started_at = time.perf_counter()
-            results = self.search_catalog_tracks(query_text, limit=self.SESSION_SEARCH_RESULT_LIMIT)
-            self._debug_candidate_query_search_ms += _elapsed_ms(search_started_at)
-            self._debug_candidate_query_search_count += 1
-            candidates = self._filter_session_search_candidates(results.get("tracks", []), excluded_ids)
-            self._debug_selection_candidate_count = len(candidates)
-            if not candidates:
-                continue
-            selection = self._select_session_track(session, plan, query_text, candidates)
-            chosen_index = min(selection.selected_index, len(candidates) - 1)
-            return [candidates[chosen_index]][:limit], query_text, selection
+            while True:
+                window = self._next_session_candidate_window(session, query_text)
+                if not window:
+                    break
+                candidates = [entry["track"] for entry in window]
+                self._debug_selection_candidate_count = len(candidates)
+                selection = self._select_session_track(session, plan, query_text, candidates)
+                if selection.selected_index < 0:
+                    self._mark_session_selection_window_screened_out(session["id"], query_text, window)
+                    continue
+                chosen_index = min(selection.selected_index, len(candidates) - 1)
+                chosen_entry = window[chosen_index]
+                self._mark_session_track_played(session["id"], query_text, window, chosen_entry["index"])
+                return [chosen_entry["track"]][:limit], query_text, selection
 
         return [], last_query, empty_selection
+
+    def _normalize_session_search_update(self, value: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"mode": "preserve", "queries": []}
+        mode = str(value.get("mode", "preserve")).strip().lower()
+        if mode not in {"preserve", "add", "replace"}:
+            mode = "preserve"
+        queries = self._normalize_search_queries(value.get("queries"))
+        if mode in {"add", "replace"} and not queries:
+            mode = "preserve"
+        if mode == "preserve":
+            queries = []
+        return {"mode": mode, "queries": queries}
+
+    def _normalize_search_queries(self, value: Any) -> list[str]:
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        queries: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            query = str(item).strip()
+            if not query:
+                continue
+            lowered = query.casefold()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            queries.append(query)
+        return queries
+
+    def _next_session_search_queries(self, runtime: dict[str, Any], search_update: dict[str, Any]) -> list[str]:
+        current_queries = self._normalize_search_queries(runtime.get("active_search_queries"))
+        mode = search_update.get("mode", "preserve")
+        new_queries = self._normalize_search_queries(search_update.get("queries"))
+        if mode == "replace":
+            return new_queries
+        if mode == "add":
+            merged = list(current_queries)
+            seen = {query.casefold() for query in merged}
+            for query in new_queries:
+                lowered = query.casefold()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                merged.append(query)
+            return merged
+        return current_queries
 
     def _filter_session_search_candidates(
         self,
@@ -1247,27 +1365,232 @@ class CiderAgentService:
         request = self._session_effective_request(session)
         return chooser(request, self, session, search_query, candidates)
 
-    def _session_excluded_track_ids(self, session: dict[str, Any], *, include_global: bool = True) -> set[str]:
+    def _normalize_session_query_pools(self, value: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_query, raw_pool in value.items():
+            query = str(raw_query).strip()
+            if not query or not isinstance(raw_pool, dict):
+                continue
+            raw_entries = raw_pool.get("entries", [])
+            entries: list[dict[str, Any]] = []
+            if isinstance(raw_entries, list):
+                for raw_entry in raw_entries:
+                    if not isinstance(raw_entry, dict) or not isinstance(raw_entry.get("track"), dict):
+                        continue
+                    state = str(raw_entry.get("state", "fresh")).strip().lower()
+                    if state not in {"fresh", "played", "screened_out", "rejected"}:
+                        state = "fresh"
+                    entries.append({"track": dict(raw_entry["track"]), "state": state})
+            cursor = raw_pool.get("cursor", 0)
+            if not isinstance(cursor, int):
+                cursor = 0
+            normalized[query] = {
+                "search_query": query,
+                "cursor": cursor % len(entries) if entries else 0,
+                "entries": entries,
+            }
+        return normalized
+
+    def _session_query_pool_build_excluded_ids(self) -> set[str]:
         excluded: set[str] = set()
-        playback = self.session_planning_playback_snapshot(session)
-        current = playback.get("track", {})
-        current_id = _clean_id(current.get("track_id"))
-        if current_id:
-            excluded.add(current_id)
-        for event in self._preferences.list_session_events(
-            session["id"],
-            limit=self.session_recent_tracks_limit(),
-            event_types=["track_selected", "track_started", "track_auto_advanced"],
-        ):
-            track_id = _clean_id(event.get("track_id"))
+        for track in self.recent_global_tracks(limit=self.global_recent_tracks_limit()):
+            track_id = _clean_id(track.get("track_id"))
             if track_id:
                 excluded.add(track_id)
-        if include_global:
-            for track in self.recent_global_tracks(limit=self.global_recent_tracks_limit()):
-                track_id = _clean_id(track.get("track_id"))
-                if track_id:
-                    excluded.add(track_id)
         return excluded
+
+    def _build_session_query_pool(self, session: dict[str, Any], search_query: str) -> dict[str, Any]:
+        raw_tracks = self._fetch_session_search_results(search_query)
+        build_excluded_ids = self._session_query_pool_build_excluded_ids()
+        cached_tracks = self._filter_session_search_candidates(raw_tracks, build_excluded_ids)
+        # Global recent history should influence pool creation, but it should not
+        # dead-end a brand-new pool when real results exist.
+        if not cached_tracks and raw_tracks and build_excluded_ids:
+            cached_tracks = self._filter_session_search_candidates(raw_tracks, set())
+        return {
+            "search_query": search_query,
+            "cursor": 0,
+            "entries": [{"track": track, "state": "fresh"} for track in cached_tracks],
+        }
+
+    def _fetch_session_search_results(self, search_query: str) -> list[dict[str, Any]]:
+        tracks: list[dict[str, Any]] = []
+        offset = 0
+        while len(tracks) < self.SESSION_SEARCH_RESULT_LIMIT:
+            page_limit = min(self.SESSION_SEARCH_PAGE_LIMIT, self.SESSION_SEARCH_RESULT_LIMIT - len(tracks))
+            search_started_at = time.perf_counter()
+            results = self.search_catalog_tracks(search_query, limit=page_limit, offset=offset)
+            self._debug_candidate_query_search_ms += _elapsed_ms(search_started_at)
+            self._debug_candidate_query_search_count += 1
+            page_tracks = list(results.get("tracks", []))
+            if not page_tracks:
+                break
+            tracks.extend(page_tracks)
+            if len(page_tracks) < page_limit:
+                break
+            offset += len(page_tracks)
+        return tracks[: self.SESSION_SEARCH_RESULT_LIMIT]
+
+    def _replace_session_query_pools(self, session: dict[str, Any], search_queries: list[str]) -> None:
+        pools: dict[str, dict[str, Any]] = {}
+        for query in self._normalize_search_queries(search_queries):
+            pools[query] = self._build_session_query_pool(session, query)
+        self._set_session_runtime(session["id"], query_pools=pools, active_search_queries=list(pools))
+
+    def _ensure_session_query_pools(self, session: dict[str, Any], search_queries: list[str]) -> None:
+        runtime = self._get_session_runtime(session["id"])
+        pools = self._normalize_session_query_pools(runtime.get("query_pools"))
+        updated = False
+        for query in self._normalize_search_queries(search_queries):
+            if query in pools:
+                continue
+            pools[query] = self._build_session_query_pool(session, query)
+            updated = True
+        if updated:
+            self._set_session_runtime(session["id"], query_pools=pools)
+
+    def _current_session_track_id(self, session: dict[str, Any]) -> str:
+        playback = self.session_planning_playback_snapshot(session)
+        current = playback.get("track", {})
+        return _clean_id(current.get("track_id"))
+
+    def _next_session_candidate_window(self, session: dict[str, Any], search_query: str) -> list[dict[str, Any]]:
+        self._ensure_session_query_pools(session, [search_query])
+        runtime = self._get_session_runtime(session["id"])
+        pools = self._normalize_session_query_pools(runtime.get("query_pools"))
+        pool = pools.get(search_query)
+        if not pool:
+            return []
+        current_track_id = self._current_session_track_id(session)
+        for _ in range(3):
+            window = self._gather_session_query_pool_window(pool, current_track_id=current_track_id)
+            if window:
+                return window
+            if self._reset_session_query_pool_state(pool, from_state="screened_out"):
+                pools[search_query] = pool
+                self._set_session_runtime(session["id"], query_pools=pools)
+                continue
+            if self._reset_session_query_pool_state(pool, from_state="played"):
+                pools[search_query] = pool
+                self._set_session_runtime(session["id"], query_pools=pools)
+                continue
+            return []
+        return []
+
+    def _gather_session_query_pool_window(
+        self,
+        pool: dict[str, Any],
+        *,
+        current_track_id: str,
+    ) -> list[dict[str, Any]]:
+        entries = list(pool.get("entries", []))
+        if not entries:
+            return []
+        cursor = int(pool.get("cursor", 0)) % len(entries)
+        window: list[dict[str, Any]] = []
+        for offset in range(len(entries)):
+            index = (cursor + offset) % len(entries)
+            entry = entries[index]
+            if entry.get("state") != "fresh":
+                continue
+            track = entry.get("track", {})
+            track_id = _clean_id(track.get("id")) or _clean_id(track.get("play_params", {}).get("id"))
+            if current_track_id and track_id == current_track_id:
+                continue
+            window.append({"index": index, "track": track})
+            if len(window) >= self.SESSION_SELECTION_WINDOW_SIZE:
+                break
+        return window
+
+    def _reset_session_query_pool_state(self, pool: dict[str, Any], *, from_state: str) -> bool:
+        changed = False
+        for entry in pool.get("entries", []):
+            if entry.get("state") == from_state:
+                entry["state"] = "fresh"
+                changed = True
+        return changed
+
+    def _update_session_query_pool_after_window(
+        self,
+        session_id: int,
+        search_query: str,
+        window: list[dict[str, Any]],
+        *,
+        selected_entry_index: int | None,
+        mark_state: str | None,
+    ) -> None:
+        runtime = self._get_session_runtime(session_id)
+        pools = self._normalize_session_query_pools(runtime.get("query_pools"))
+        pool = pools.get(search_query)
+        if not pool or not pool.get("entries"):
+            return
+        entries = pool["entries"]
+        if mark_state is not None:
+            for entry in window:
+                entries[entry["index"]]["state"] = mark_state
+        if selected_entry_index is not None and 0 <= selected_entry_index < len(entries):
+            entries[selected_entry_index]["state"] = "played"
+            selected_track = entries[selected_entry_index]["track"]
+            self._set_session_runtime(
+                session_id,
+                current_pool_query=search_query,
+                current_track_id=_clean_id(selected_track.get("id")) or _clean_id(selected_track.get("play_params", {}).get("id")),
+            )
+        last_index = window[-1]["index"]
+        pool["cursor"] = (last_index + 1) % len(entries)
+        pools[search_query] = pool
+        self._set_session_runtime(session_id, query_pools=pools)
+
+    def _mark_session_selection_window_screened_out(
+        self,
+        session_id: int,
+        search_query: str,
+        window: list[dict[str, Any]],
+    ) -> None:
+        self._update_session_query_pool_after_window(
+            session_id,
+            search_query,
+            window,
+            selected_entry_index=None,
+            mark_state="screened_out",
+        )
+
+    def _mark_session_track_played(
+        self,
+        session_id: int,
+        search_query: str,
+        window: list[dict[str, Any]],
+        selected_entry_index: int,
+    ) -> None:
+        self._update_session_query_pool_after_window(
+            session_id,
+            search_query,
+            window,
+            selected_entry_index=selected_entry_index,
+            mark_state=None,
+        )
+
+    def _mark_session_track_rejected(self, session_id: int, track_id: str) -> None:
+        runtime = self._get_session_runtime(session_id)
+        pools = self._normalize_session_query_pools(runtime.get("query_pools"))
+        preferred_query = str(runtime.get("current_pool_query", "")).strip()
+        ordered_queries = [preferred_query] if preferred_query else []
+        ordered_queries.extend(query for query in pools if query != preferred_query)
+        for query in ordered_queries:
+            pool = pools.get(query)
+            if not pool:
+                continue
+            for entry in pool.get("entries", []):
+                entry_track = entry.get("track", {})
+                entry_track_id = _clean_id(entry_track.get("id")) or _clean_id(entry_track.get("play_params", {}).get("id"))
+                if entry_track_id != track_id:
+                    continue
+                entry["state"] = "rejected"
+                pools[query] = pool
+                self._set_session_runtime(session_id, query_pools=pools, current_track_id=track_id)
+                return
 
     def _record_current_track_for_session(
         self,
@@ -1304,6 +1627,54 @@ class CiderAgentService:
                 "href": None,
             },
         )
+
+    def _begin_resolver_debug_episode(self, reason: str) -> bool:
+        path = self.resolver_debug_log_path()
+        if path is None:
+            return False
+        with self._resolver_debug_log_lock:
+            if self._resolver_debug_episode_depth == 0:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"timestamp: {self.current_timestamp()}\nreason: {reason}\n\n",
+                    encoding="utf-8",
+                )
+            self._resolver_debug_episode_depth += 1
+            return True
+
+    def _end_resolver_debug_episode(self, started: bool) -> None:
+        if not started:
+            return
+        with self._resolver_debug_log_lock:
+            self._resolver_debug_episode_depth = max(0, self._resolver_debug_episode_depth - 1)
+
+    def append_resolver_debug_log(
+        self,
+        *,
+        stage: str,
+        messages: list[dict[str, Any]],
+        response_body: dict[str, Any],
+        response_content: str,
+    ) -> None:
+        path = self.resolver_debug_log_path()
+        if path is None:
+            return
+        entry = (
+            f"=== {stage} ===\n"
+            f"timestamp: {self.current_timestamp()}\n"
+            "messages:\n"
+            f"{json.dumps(messages, ensure_ascii=False, indent=2)}\n\n"
+            "response_body:\n"
+            f"{json.dumps(response_body, ensure_ascii=False, indent=2)}\n\n"
+            "response_content:\n"
+            f"{response_content}\n\n"
+        )
+        with self._resolver_debug_log_lock:
+            if self._resolver_debug_episode_depth <= 0:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(entry)
 
     def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
         runtime = self._get_session_runtime(session["id"])

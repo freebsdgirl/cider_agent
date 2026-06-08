@@ -85,10 +85,11 @@ class Settings:
     resolver_api_key: str | None = None
     resolver_include_reasoning: bool = False
     resolver_include_raw_output: bool = False
+    resolver_debug_log_path: Path | None = None
     include_timing_debug: bool = False
     response_detail: str = "compact"
-    session_recent_tracks_limit: int = 20
-    global_recent_tracks_limit: int = 50
+    session_recent_tracks_limit: int = 10
+    global_recent_tracks_limit: int = 10
     request_timeout_seconds: float = 60.0
     verify_tls: bool = True
     log_level: str = "INFO"
@@ -135,6 +136,11 @@ class Settings:
                 False,
             )
         )
+        resolver_debug_log_path_raw = _config_or_env(
+            config,
+            "CIDER_AGENT_RESOLVER_DEBUG_LOG_PATH",
+            "resolver_debug_log_path",
+        )
         include_timing_debug = _as_bool(
             _config_or_env(
                 config,
@@ -156,7 +162,7 @@ class Settings:
                 config,
                 "CIDER_AGENT_SESSION_RECENT_TRACKS_LIMIT",
                 "session_recent_tracks_limit",
-                20,
+                10,
             )
         )
         global_recent_tracks_limit = int(
@@ -164,7 +170,7 @@ class Settings:
                 config,
                 "CIDER_AGENT_GLOBAL_RECENT_TRACKS_LIMIT",
                 "global_recent_tracks_limit",
-                50,
+                10,
             )
         )
         request_timeout_seconds = float(
@@ -186,6 +192,11 @@ class Settings:
         cider_api_token = str(cider_api_token_raw).strip() if cider_api_token_raw is not None else None
         resolver_model = str(resolver_model_raw).strip() if resolver_model_raw is not None else None
         resolver_api_key = str(resolver_api_key_raw).strip() if resolver_api_key_raw is not None else None
+        resolver_debug_log_path = (
+            Path(str(resolver_debug_log_path_raw)).expanduser()
+            if resolver_debug_log_path_raw not in {None, ""}
+            else None
+        )
 
         if not http_host:
             raise CiderConfigError("http_host cannot be empty.")
@@ -227,6 +238,7 @@ class Settings:
             resolver_api_key=resolver_api_key,
             resolver_include_reasoning=resolver_include_reasoning,
             resolver_include_raw_output=resolver_include_raw_output,
+            resolver_debug_log_path=resolver_debug_log_path,
             include_timing_debug=include_timing_debug,
             response_detail=response_detail,
             session_recent_tracks_limit=session_recent_tracks_limit,
@@ -255,6 +267,7 @@ class Settings:
             "has_resolver_api_key": bool(self.resolver_api_key),
             "resolver_include_reasoning": self.resolver_include_reasoning,
             "resolver_include_raw_output": self.resolver_include_raw_output,
+            "resolver_debug_log_path": str(self.resolver_debug_log_path) if self.resolver_debug_log_path else None,
             "include_timing_debug": self.include_timing_debug,
             "response_detail": self.response_detail,
             "session_recent_tracks_limit": self.session_recent_tracks_limit,

@@ -58,6 +58,7 @@ class StubRpcClient:
         )
         self.queue_items = [self._track("queued-track", "Queued", "Queued Artist", "Queued Album")]
         self.posts: list[dict[str, Any]] = []
+        self.search_catalog_calls: list[dict[str, Any]] = []
 
     def _track(
         self,
@@ -130,7 +131,8 @@ class StubRpcClient:
         }
         return catalog_map.get(item_id, self._track(item_id or "unknown-track", item_id or "Unknown"))
 
-    def search_catalog(self, query: str, *, limit: int, storefront: str):
+    def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+        self.search_catalog_calls.append({"query": query, "limit": limit, "storefront": storefront, "offset": offset})
         if query == "Favorite Artist Liked Song":
             return {
                 "data": {
@@ -188,6 +190,28 @@ class StubRpcClient:
                                         "playParams": {"id": "catalog-track-3", "kind": "songs", "isLibrary": False},
                                     },
                                 }
+                            ]
+                        }
+                    }
+                }
+            }
+        if query == "Favorite Artist Wide Pool":
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": f"catalog-wide-{index}",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": f"Wide Song {index}",
+                                        "artistName": "Favorite Artist",
+                                        "albumName": "Album",
+                                        "playParams": {"id": f"catalog-wide-{index}", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                                for index in range(1, 9)
                             ]
                         }
                     }
