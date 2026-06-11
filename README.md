@@ -1,15 +1,37 @@
 # Cider Agent
 
-`cider_agent` is a standalone Python service that owns audio control for the Cider Apple Music client. It gives other agents a text-first A2A endpoint for delegating music tasks, plus a local CLI for direct use.
+`cider_agent` is a dedicated music-control agent for the Cider Apple Music client. It exposes a text-first A2A interface for delegation from another agent, plus a local CLI for direct use.
 
-V1 includes:
+The project is built around a simple idea: keep the main conversational agent lean, and hand off music work to a narrow specialist.
 
-- playback control
-- queue inspection and mutation
-- Apple Music catalog and library search
-- library playlist browse
+## Design Philosophy
+
+Many agent harnesses assume frontier models can absorb large tool surfaces, long instruction blocks, and lots of command schema without falling apart. Smaller local models usually do worse at that. They get slower, more error-prone, and more likely to lose the thread.
+
+`cider_agent` is designed to reduce that cognitive load.
+
+- The conversational agent stays the main user-facing entrypoint.
+- It does not need to memorize a large music-control schema.
+- It delegates plain-language requests to a small specialist agent.
+- The specialist agent keeps prompts tight and moves stateful work into code.
+- The resolver is only asked to make small grounded decisions.
+
+In practice, that means:
+
+- natural language is the main contract: `play some music`, `more pop`, `i don't like this`
+- playback state, preference memory, repeat avoidance, playlist lookup, and session caches live in code rather than prompt text
+- the resolver chooses an action, plans a short query, or selects from a very small window of real candidates instead of inventing tracks
+- the service layer is transport-agnostic, so A2A, CLI, and future transports such as MCP can reuse the same domain logic
+
+This project is less about adding an LLM to music control and more about constraining the LLM so a smaller local stack stays fast and reliable.
+
+## What It Does
+
+- text-first playback control for Cider
+- adaptive sessions for vague or descriptive music requests
+- playlist listing and play-by-name through natural-language requests
 - music-specific preference memory in SQLite
-- optional OpenAI-compatible text resolver for natural-language requests
+- a tiny public structured control surface for direct integrations
 
 ## Requirements
 
@@ -35,33 +57,20 @@ Config resolution order:
 2. `./config.json`
 3. `~/.config/cider-agent/config.json`
 
-Environment variable overrides are available for every field:
+See `config.example.json` for the full schema. Every setting also supports an environment-variable override. The most commonly used ones are:
 
-- `CIDER_AGENT_HTTP_HOST`
-- `CIDER_AGENT_HTTP_PORT`
 - `CIDER_AGENT_PUBLIC_BASE_URL`
 - `CIDER_AGENT_CIDER_BASE_URL`
 - `CIDER_AGENT_CIDER_API_TOKEN`
-- `CIDER_AGENT_DEFAULT_SEARCH_SOURCE`
 - `CIDER_AGENT_RESOLVER_BACKEND`
 - `CIDER_AGENT_RESOLVER_BASE_URL`
 - `CIDER_AGENT_RESOLVER_MODEL`
 - `CIDER_AGENT_RESOLVER_API_KEY`
-- `CIDER_AGENT_RESOLVER_INCLUDE_REASONING`
-- `CIDER_AGENT_RESOLVER_INCLUDE_RAW_OUTPUT`
-- `CIDER_AGENT_RESOLVER_DEBUG_LOG_PATH`
-- `CIDER_AGENT_INCLUDE_TIMING_DEBUG`
-- `CIDER_AGENT_RESPONSE_DETAIL`
-- `CIDER_AGENT_SESSION_RECENT_TRACKS_LIMIT`
-- `CIDER_AGENT_GLOBAL_RECENT_TRACKS_LIMIT`
-- `CIDER_AGENT_REQUEST_TIMEOUT_SECONDS`
-- `CIDER_AGENT_VERIFY_TLS`
-- `CIDER_AGENT_LOG_LEVEL`
 - `CIDER_AGENT_DATABASE_PATH`
 
 ## Run
 
-CLI:
+CLI examples:
 
 ```bash
 cider-agent play
@@ -72,12 +81,13 @@ cider-agent preferences forget 12
 cider-agent ask "play some kep1er"
 cider-agent ask "play something upbeat for the morning"
 cider-agent ask "play some music"
+cider-agent ask "what playlists do I have?"
+cider-agent ask "play playlist Mix"
 cider-agent ask "i don't like this"
 cider-agent ask "i like this track"
-cider-agent serve
 ```
 
-A2A server:
+Start the A2A server:
 
 ```bash
 cider-agent-serve
@@ -92,9 +102,9 @@ Published endpoints:
 - `GET /.well-known/agent-card.json`
 - `GET /healthz`
 
-## A2A integration
+## A2A Usage
 
-The intended integration path is plain-language text requests over A2A. Upstream conversational agents do not need to know the internal action schema. In the common case, they only need to know:
+The intended integration path is plain-language text requests. Upstream conversational agents do not need to know the internal action schema. In the common case, they only need to know:
 
 - `cider_agent` exists
 - it accepts natural-language music requests
@@ -135,11 +145,19 @@ Typical text requests:
 - `i like this track`
 - `what's playing?`
 
-Responses include a compact `summary` field for tool-friendly consumption, plus the structured execution payload.
+Responses include a compact `summary` field for tool-friendly consumption plus the structured execution payload.
 
-## Structured actions
+## Structured Actions
 
-Structured requests still exist for integrations that want a tiny direct control surface, but they are not required for ordinary use. Everything outside the small exposed action set should go through plain-language text requests.
+Structured requests still exist for integrations that want a tiny direct-control surface, but they are intentionally small. Everything richer should go through plain-language text requests.
+
+Exposed structured actions:
+
+- `play`
+- `pause`
+- `stop`
+- `list_preferences`
+- `forget_preference`
 
 Structured requests should send a `data` part:
 
@@ -167,72 +185,29 @@ Structured requests should send a `data` part:
 }
 ```
 
-Exposed structured actions:
+Playlist listing, playlist play-by-name, adaptive sessions, queue-aware behavior, and current-track feedback are available through text requests and intentionally hidden from the public structured contract.
 
-- `play`
-- `pause`
-- `stop`
-- `list_preferences`
-- `forget_preference`
+## How It Works
 
-Hidden internal actions:
-
-- adaptive session, search, queue, resolver, and current-track feedback actions still exist internally
-- playlist listing and play-by-name are available through plain-language text requests
-- they are intentionally not part of the public structured contract
-- callers should use `cider-agent ask ...` or A2A text messages for those behaviors
-
-## Architecture
-
-`cider_agent` is built around a transport-agnostic service layer. The CLI and A2A server are thin adapters over the same core engine, so future transports such as MCP or a local web UI can reuse the same playback, search, and session logic.
-
-Text requests follow a grounded two-step flow:
-
-1. the resolver decides whether the request is a direct control action, a session/search request, or a steering update
-2. for adaptive sessions, `cider_agent` searches Apple Music first and then asks the resolver to choose from real catalog candidates instead of trusting guessed track names
-
-Adaptive sessions are cache-driven:
-
-- each active query pool caches up to 100 real catalog tracks
-- the resolver only sees the next eligible window of 6 tracks at a time
-- cache entry state drives repeat avoidance and retry behavior
-- steering can preserve existing query pools, add new ones, or replace them entirely
-- extremely vague requests such as `play some music` can bootstrap from saved liked-track cues, favored artists, and directly liked tracks before normal adaptive selection takes over
+- The core service owns playback, search, session state, and preference memory.
+- The CLI and A2A server are thin adapters over that same service layer.
+- Descriptive or vague `play` requests usually start an adaptive session instead of one-shot playback.
+- Adaptive sessions search real Apple Music candidates first, then ask the resolver to choose from a small candidate window instead of making it invent songs.
+- Very vague requests such as `play some music` can bootstrap from saved liked-track cues, favored artists, and directly liked tracks before normal adaptive selection takes over.
 
 Track cache entries move through a small state machine:
 
-- `fresh`: not yet used in the current cache pass
-- `played`: already selected and played in the current cache lifecycle
-- `screened_out`: shown to the resolver in a 6-track window that it rejected as unsuitable
-- `rejected`: explicitly rejected by the user and kept unavailable until the query pool changes
+- `fresh`
+- `played`
+- `screened_out`
+- `rejected`
 
-This keeps most of the memory and repeat-avoidance work in the service instead of making the LLM re-evaluate large recent-history blobs on every turn.
+That keeps repeat avoidance and memory work in code rather than forcing the LLM to re-evaluate a giant history blob every turn.
 
-## Operational notes
+## Notes
 
-- Generic `search` uses `default_search_source` from config, which defaults to `catalog`.
-- Text requests go through the configured resolver backend. `fallback` only supports tiny direct commands like `play` and `pause`; `openai_compatible` sends chat-completions requests to a configurable OpenAI-style endpoint, including local endpoints such as Ollama when they expose the same API shape.
-- Generic or descriptive `play` requests usually start an adaptive session. Specific track requests still resolve to one-shot playback.
-- Playlist requests are text-first right now: asking to list playlists or play a playlist by name goes through the local resolver path rather than the tiny public structured API.
-- `response_detail` defaults to `compact`, which trims tool-facing execution results down to summaries instead of returning full raw Apple Music and Cider payloads.
-- The default request timeout is 60 seconds to accommodate slower local models and Cider RPC calls.
-
-## Development notes
-
-- The RPC client sends both `apptoken` and `apitoken` headers because shipped Cider builds vary.
-- Current Cider RPC builds reject larger per-request catalog search limits, so 100-track adaptive pools are fetched as two paginated searches of 50.
-- When a pool runs out of `fresh` candidates, the service first resets `screened_out`, then later resets `played` after full-pass exhaustion. If all entries become unusable, the service can replan or rebuild pools before finally giving up with `No playable candidate match could be resolved.`
-- Mid-session steering accepts an optional `search_update` object with `mode` of `preserve`, `add`, or `replace`.
-- `preserve` keeps the current query pools and only changes future selection behavior.
-- `add` keeps the current pools and adds newly planned search pools alongside them.
-- `replace` discards the current pools and rebuilds from the replacement query set.
-- `like_current_track` is the lightweight "save this one" action. It stores the current track, its artist, and the active session cue/query context without changing playback.
-- `reject_current_track` is the "never this exact track again" action. It marks the current cached entry as rejected for the active session, persists a global hard reject, and immediately advances.
-- `resolver_include_reasoning` is a debug-only option. When enabled, `cider_agent` includes model-provided reasoning text if the resolver backend returns it.
-- `resolver_include_raw_output` is another debug-only option. When enabled, `cider_agent` includes the resolver's exact raw `message.content` as `resolver_raw_content`, plus the parsed JSON object as `resolver_raw_action`.
-- `resolver_debug_log_path` keeps a plain-text resolver trace file for the current resolver episode, wiping it each time a new episode starts and appending every resolver prompt/response involved in that episode.
-- `include_timing_debug` attaches timing breakdowns to text requests and adaptive session execution so you can see whether latency is coming from resolver calls, Cider RPC state snapshots, catalog lookups, or playback actions.
-- `session_recent_tracks_limit` only affects status-style responses and summaries. It does not drive adaptive track selection.
-- `global_recent_tracks_limit` controls how many recently played tracks across all sessions are used when building brand-new, additive, or replacement adaptive query pools. It does not act as a hard exclusion against an already-built in-session cache. The default is `10`.
-- Resolver session prompts are intentionally compact now. Session planning no longer includes recent session tracks, and session selection no longer includes recent/global history blobs or bulky metadata like artwork URLs, ISRCs, or raw play params.
-- Live verification against a current Cider build showed `/api/v1/amapi/run-v3` behaves as a read-only `path` passthrough.
+- The public structured API is intentionally tiny; text is the main interface.
+- Playlist requests are text-first right now.
+- Resolver prompts are intentionally compact for smaller local models.
+- `response_detail` defaults to `compact` so tool-facing responses stay small.
+- The default request timeout is `60` seconds to accommodate slower local models and Cider RPC calls.
