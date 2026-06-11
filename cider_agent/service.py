@@ -1382,6 +1382,25 @@ class CiderAgentService:
         # dead-end a brand-new pool when real results exist.
         if not cached_tracks and raw_tracks and recent_track_ids:
             cached_tracks = self._filter_session_search_candidates(raw_tracks, global_rejected_ids)
+        self.append_session_debug_log(
+            stage="session_query_pool_built",
+            payload={
+                "session_id": session.get("id"),
+                "search_query": search_query,
+                "cursor": 0,
+                "raw_track_count": len(raw_tracks),
+                "pool_track_count": len(cached_tracks),
+                "sample_tracks": [
+                    {
+                        "id": track.get("id"),
+                        "title": track.get("title"),
+                        "artist": track.get("artist"),
+                        "album": track.get("album"),
+                    }
+                    for track in cached_tracks[:12]
+                ],
+            },
+        )
         return {
             "search_query": search_query,
             "cursor": 0,
@@ -1651,6 +1670,15 @@ class CiderAgentService:
             updated = True
         if updated:
             self._set_session_runtime(session["id"], query_pools=pools)
+            self.append_session_debug_log(
+                stage="session_query_pools_initialized",
+                payload={
+                    "session_id": session.get("id"),
+                    "active_search_queries": self._normalize_search_queries(runtime.get("active_search_queries")),
+                    "pool_queries": list(pools),
+                    "pool_count": len(pools),
+                },
+            )
 
     def _current_session_track_id(self, session: dict[str, Any]) -> str:
         playback = self.session_planning_playback_snapshot(session)
@@ -1658,6 +1686,11 @@ class CiderAgentService:
         return _clean_id(current.get("track_id"))
 
     def _next_session_candidate_window(self, session: dict[str, Any], search_query: str) -> list[dict[str, Any]]:
+        # Session selection is intentionally cursor-based and sequential:
+        # build one ordered pool per search query, offer the next window of
+        # fresh tracks starting at the pool cursor, and rely on entry state
+        # (`played`, `screened_out`, `rejected`) to prevent replaying the same
+        # candidates until the pool has been exhausted and explicitly reset.
         self._ensure_session_query_pools(session, [search_query])
         runtime = self._get_session_runtime(session["id"])
         pools = self._normalize_session_query_pools(runtime.get("query_pools"))
@@ -1667,8 +1700,31 @@ class CiderAgentService:
         current_track_id = self._current_session_track_id(session)
         for _ in range(3):
             window = self._gather_session_query_pool_window(pool, current_track_id=current_track_id)
+            self.append_session_debug_log(
+                stage="session_candidate_window",
+                payload={
+                    "session_id": session.get("id"),
+                    "search_query": search_query,
+                    "cursor": pool.get("cursor", 0),
+                    "pool_track_count": len(pool.get("entries", [])),
+                    "window_track_count": len(window),
+                    "window_tracks": [
+                        {
+                            "index": entry["index"],
+                            "id": entry["track"].get("id"),
+                            "title": entry["track"].get("title"),
+                            "artist": entry["track"].get("artist"),
+                            "album": entry["track"].get("album"),
+                        }
+                        for entry in window
+                    ],
+                },
+            )
             if window:
                 return window
+            # Once a pool has no fresh candidates left, screened-out tracks are
+            # reconsidered before played tracks. Rejected tracks are never reset
+            # here; they stay unavailable until the pool is rebuilt.
             if self._reset_session_query_pool_state(pool, from_state="screened_out"):
                 pools[search_query] = pool
                 self._set_session_runtime(session["id"], query_pools=pools)
@@ -1686,6 +1742,9 @@ class CiderAgentService:
         *,
         current_track_id: str,
     ) -> list[dict[str, Any]]:
+        # This is deliberately simple: starting at the cursor, walk forward
+        # through the ordered pool and collect the first N fresh entries.
+        # There is no diversification, reranking, or random sampling here.
         entries = list(pool.get("entries", []))
         if not entries:
             return []
@@ -1728,6 +1787,12 @@ class CiderAgentService:
         if not pool or not pool.get("entries"):
             return
         entries = pool["entries"]
+        # Window state is persistent across advances:
+        # - if the resolver rejects the whole window, every shown entry becomes
+        #   `screened_out`
+        # - if one entry is chosen, only that entry becomes `played`
+        # In both cases the cursor advances to just after the last shown entry,
+        # so the next call offers the next sequential slice of the pool.
         if mark_state is not None:
             for entry in window:
                 entries[entry["index"]]["state"] = mark_state
@@ -1744,6 +1809,25 @@ class CiderAgentService:
         pool["cursor"] = (last_index + 1) % len(entries)
         pools[search_query] = pool
         self._set_session_runtime(session_id, query_pools=pools)
+        self.append_session_debug_log(
+            stage="session_candidate_window_updated",
+            payload={
+                "session_id": session_id,
+                "search_query": search_query,
+                "applied_state": mark_state,
+                "selected_entry_index": selected_entry_index,
+                "new_cursor": pool["cursor"],
+                "window_tracks": [
+                    {
+                        "index": entry["index"],
+                        "id": entry["track"].get("id"),
+                        "title": entry["track"].get("title"),
+                        "artist": entry["track"].get("artist"),
+                    }
+                    for entry in window
+                ],
+            },
+        )
 
     def _mark_session_selection_window_screened_out(
         self,
@@ -1878,8 +1962,25 @@ class CiderAgentService:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(entry)
 
+    def append_session_debug_log(self, *, stage: str, payload: dict[str, Any]) -> None:
+        path = self.resolver_debug_log_path()
+        if path is None:
+            return
+        entry = (
+            f"=== {stage} ===\n"
+            f"timestamp: {self.current_timestamp()}\n"
+            "payload:\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        )
+        with self._resolver_debug_log_lock:
+            if self._resolver_debug_episode_depth <= 0:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(entry)
+
     def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
-        runtime = self._get_session_runtime(session["id"])
+        runtime = self._effective_session_runtime(session["id"])
         if runtime.get("suspended"):
             return False
         if runtime.get("advance_in_progress"):
@@ -1891,6 +1992,23 @@ class CiderAgentService:
             return False
         return True
 
+    def _effective_session_runtime(self, session_id: int) -> dict[str, Any]:
+        runtime = self._get_session_runtime(session_id)
+        # Session control can be split across processes. If this process has no
+        # in-memory runtime for the active session yet, fall back to the
+        # persisted session_runtime row so cooldown and suspended state still
+        # prevent a duplicate advance.
+        stored = self._preferences.get_session_runtime(session_id) or {}
+        if "suspended" not in runtime and stored:
+            runtime["suspended"] = stored.get("active_intent") == "suspended"
+        if "last_advance_at" not in runtime and stored.get("last_advance_at") is not None:
+            runtime["last_advance_at"] = stored.get("last_advance_at")
+        if "last_selected_track_id" not in runtime and stored.get("last_selected_track_id") is not None:
+            runtime["last_selected_track_id"] = stored.get("last_selected_track_id")
+        if "last_known_playback_state" not in runtime and stored.get("last_known_playback_state") is not None:
+            runtime["last_known_playback_state"] = stored.get("last_known_playback_state")
+        return runtime
+
     def _get_session_runtime(self, session_id: int) -> dict[str, Any]:
         with self._session_runtime_lock:
             return dict(self._session_runtime.get(session_id, {}))
@@ -1900,6 +2018,26 @@ class CiderAgentService:
             runtime = dict(self._session_runtime.get(session_id, {}))
             runtime.update(updates)
             self._session_runtime[session_id] = runtime
+        if updates:
+            interesting = {
+                key: value
+                for key, value in updates.items()
+                if key in {"active_search_queries", "query_pools", "current_pool_query", "current_track_id", "suspended"}
+            }
+            if "query_pools" in interesting and isinstance(interesting["query_pools"], dict):
+                interesting["query_pools"] = {
+                    str(query): {
+                        "cursor": pool.get("cursor", 0),
+                        "entry_count": len(pool.get("entries", [])) if isinstance(pool, dict) else 0,
+                    }
+                    for query, pool in interesting["query_pools"].items()
+                    if isinstance(pool, dict)
+                }
+            if interesting:
+                self.append_session_debug_log(
+                    stage="session_runtime_updated",
+                    payload={"session_id": session_id, "updates": interesting},
+                )
 
     def _clear_session_runtime(self, session_id: int) -> None:
         with self._session_runtime_lock:
@@ -1909,6 +2047,7 @@ class CiderAgentService:
     def _clear_all_session_runtime(self) -> None:
         with self._session_runtime_lock:
             self._session_runtime.clear()
+        self.append_session_debug_log(stage="session_runtime_cleared", payload={"scope": "all"})
 
     def _abort_failed_session_start(self, session_id: int) -> None:
         active = self._preferences.get_active_session()

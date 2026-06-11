@@ -418,6 +418,53 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
     assert result["tracks"][0]["title"] == "Liked Song"
 
 
+def test_session_worker_respects_persisted_cooldown_across_processes(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "cross-process-cooldown.db"
+    rpc = service._rpc.__class__()
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    second = CiderAgentService(
+        first._settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=first._resolver,
+    )
+
+    first.play_session("play upbeat music")
+    rpc.is_playing = False
+    rpc.current_track = None
+
+    session = second._preferences.get_active_session()
+    assert session is not None
+    assert second._get_session_runtime(session["id"]) == {}
+    assert second._should_advance_session(session, second.playback_snapshot()) is False
+
+
 def test_reject_current_track_advances_active_session_without_changing_vibe(service) -> None:
     service.play_session("play upbeat music")
 
