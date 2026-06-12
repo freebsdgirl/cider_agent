@@ -98,8 +98,14 @@ cider-agent serve
 Published endpoints:
 
 - `POST /a2a`
-- `GET /.well-known/agent.json`
 - `GET /.well-known/agent-card.json`
+- `POST /message:send`
+- `POST /message:stream`
+- `GET /tasks`
+- `GET /tasks/{id}`
+- `POST /tasks/{id}:cancel`
+- `GET /tasks/{id}:subscribe`
+- `POST /tasks/{id}:subscribe`
 - `GET /healthz`
 
 ## A2A Usage
@@ -116,16 +122,15 @@ Recommended request shape:
 {
   "jsonrpc": "2.0",
   "id": "1",
-  "method": "message/send",
+  "method": "SendMessage",
   "params": {
     "message": {
-      "kind": "message",
       "messageId": "msg-1",
-      "role": "user",
+      "role": "ROLE_USER",
       "parts": [
         {
-          "kind": "text",
-          "text": "play upbeat morning music"
+          "text": "play upbeat morning music",
+          "mediaType": "text/plain"
         }
       ]
     }
@@ -146,6 +151,7 @@ Typical text requests:
 - `what's playing?`
 
 Responses include a compact `summary` field for tool-friendly consumption plus the structured execution payload.
+Read-only requests currently complete as completed tasks, and mutating requests can be returned as submitted tasks when `returnImmediately` is used.
 
 ## Structured Actions
 
@@ -165,19 +171,18 @@ Structured requests should send a `data` part:
 {
   "jsonrpc": "2.0",
   "id": "1",
-  "method": "message/send",
+  "method": "SendMessage",
   "params": {
     "message": {
-      "kind": "message",
       "messageId": "msg-1",
-      "role": "user",
+      "role": "ROLE_USER",
       "parts": [
         {
-          "kind": "data",
           "data": {
             "action": "play",
             "parameters": {}
-          }
+          },
+          "mediaType": "application/json"
         }
       ]
     }
