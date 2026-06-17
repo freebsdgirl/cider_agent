@@ -1919,7 +1919,7 @@ def test_paused_session_runtime_survives_restart(settings, service, tmp_path) ->
     assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
 
 
-def test_active_stopped_session_can_continue_after_restart(settings, service, tmp_path) -> None:
+def test_active_stopped_session_is_suspended_after_restart(settings, service, tmp_path) -> None:
     database_path = tmp_path / "active-restart.db"
     rpc = service._rpc.__class__()
     first = CiderAgentService(
@@ -1962,10 +1962,61 @@ def test_active_stopped_session_can_continue_after_restart(settings, service, tm
 
     session = restarted._preferences.get_active_session()
     assert session is not None
+    assert restarted._get_session_runtime(session["id"])["suspended"] is True
+    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
+
+
+def test_explicit_play_resumes_stopped_session_after_restart(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "resume-after-restart.db"
+    rpc = service._rpc.__class__()
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    first.play_session("play upbeat music")
+    rpc.is_playing = False
+    rpc.current_track = None
+
+    restarted = CiderAgentService(
+        first._settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=first._resolver,
+    )
+
+    session = restarted._preferences.get_active_session()
+    assert session is not None
+    assert restarted._get_session_runtime(session["id"])["suspended"] is True
+
+    result = restarted.play()
+
+    assert result["status"] == "ok"
     assert restarted._get_session_runtime(session["id"])["suspended"] is False
-    restarted._set_session_runtime(session["id"], last_advance_at=0.0)
-    restarted._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
-    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is True
+    assert restarted.playback_snapshot()["is_playing"] is True
+    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
 
 
 def test_reconcile_without_active_session_has_no_runtime(settings, service, tmp_path) -> None:

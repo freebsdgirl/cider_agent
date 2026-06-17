@@ -225,7 +225,9 @@ class CiderAgentService:
             return
         stored_runtime = self._preferences.get_session_runtime(session["id"]) or {}
         playback = self.playback_snapshot()
-        suspended = stored_runtime.get("active_intent") == "suspended"
+        # Never auto-resume a stopped adaptive session just because the service
+        # process restarted. Explicit resume/play commands can unsuspend it.
+        suspended = stored_runtime.get("active_intent") == "suspended" or not bool(playback.get("is_playing"))
         self._set_session_runtime(
             session["id"],
             suspended=suspended,
