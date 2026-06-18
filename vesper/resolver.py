@@ -195,6 +195,7 @@ class OpenAICompatibleResolver:
         if not isinstance(parameters, dict):
             raise ResolverError("Resolver output parameters must be an object.")
         parameters = self._normalize_parameters(action, parameters, original_text=text)
+        action, parameters = self._normalize_playback_intent(action, parameters)
         return ResolvedAction(
             action=action,
             parameters=parameters,
@@ -586,7 +587,7 @@ class OpenAICompatibleResolver:
                 specs.append("play_search_result(query[, source, index])")
                 continue
             if definition.name == "play_candidate_match":
-                specs.append("play_candidate_match(candidate_tracks|candidate_artists|candidate_queries)")
+                specs.append("play_candidate_match(candidate_tracks|candidate_queries)")
                 continue
             if definition.name == "set_volume":
                 specs.append("set_volume(volume)")
@@ -605,6 +606,20 @@ class OpenAICompatibleResolver:
                 continue
             specs.append(f"{definition.name}()")
         return specs
+
+    def _normalize_playback_intent(
+        self,
+        action: str,
+        parameters: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        if action != "play_candidate_match":
+            return action, parameters
+
+        candidate_tracks = parameters.get("candidate_tracks", [])
+        candidate_artists = parameters.pop("candidate_artists", [])
+        if not candidate_tracks and candidate_artists:
+            return "play_session", {"request": candidate_artists[0]}
+        return action, parameters
 
     def _normalize_query_text(self, query: str) -> str:
         cleaned = query.strip()

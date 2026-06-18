@@ -219,6 +219,9 @@ def test_handle_text_request_can_start_adaptive_session(service) -> None:
     assert result["execution"]["result"]["result"]["enqueued_count"] == 0
     assert "primary_track" in result["execution"]["result"]["result"]
     assert result["summary"].startswith("playing ")
+    assert service._rpc.posts[-2]["path"] == "/queue/clear-queue"
+    assert service._rpc.posts[-1]["path"] == "/play-item"
+    assert service._rpc.queue_items == []
 
 
 def test_adaptive_session_timing_debug_includes_selection_breakdown(settings, service, tmp_path) -> None:
@@ -1584,12 +1587,16 @@ def test_handle_text_request_preserves_debug_output_on_execution_error(settings,
 def test_play_candidate_match_prefers_track_candidate(service) -> None:
     result = service.play_candidate_match(
         candidate_tracks=[{"title": "Liked Song", "artist": "Favorite Artist"}],
-        candidate_artists=["Favorite Artist"],
         candidate_queries=["k-pop"],
     )
 
     assert result["selection_strategy"] == "candidate_track_exactish_match"
     assert result["selected_track"]["play_params"]["id"] == "catalog-track-favorite"
+
+
+def test_play_candidate_match_does_not_treat_artist_as_one_track(service) -> None:
+    with pytest.raises(CiderValidationError, match="No playable candidate match"):
+        service.run_action("play_candidate_match", {"candidate_artists": ["RADWIMPS"]})
 
 
 def test_collect_session_tracks_uses_track_artist_as_fallback_artist(settings, service, tmp_path) -> None:

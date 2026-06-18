@@ -1120,6 +1120,7 @@ class CiderAgentService:
             session_id=session["id"],
         )
         try:
+            self._rpc.playback_post("/queue/clear-queue")
             result = self._play_session_track_with_debug_episode(
                 session,
                 selection_strategy="adaptive-session-start",
@@ -1288,12 +1289,10 @@ class CiderAgentService:
         self,
         *,
         candidate_tracks: list[dict[str, str]] | None = None,
-        candidate_artists: list[str] | None = None,
         candidate_queries: list[str] | None = None,
         storefront: str = "us",
     ) -> dict[str, Any]:
         track_candidates = candidate_tracks or []
-        artist_candidates = candidate_artists or []
         query_candidates = candidate_queries or []
 
         for candidate in track_candidates:
@@ -1308,21 +1307,6 @@ class CiderAgentService:
                 return {
                     "status": "ok",
                     "selection_strategy": "candidate_track_exactish_match",
-                    "selected_track": match,
-                    "playback": playback,
-                }
-
-        for artist in artist_candidates:
-            artist_name = str(artist).strip()
-            if not artist_name:
-                continue
-            search = self.search_catalog_tracks(artist_name, limit=10, storefront=storefront)
-            match = self._best_artist_track_match(search["tracks"], artist=artist_name)
-            if match is not None:
-                playback = self._play_flattened_track(match, is_library_default=False)
-                return {
-                    "status": "ok",
-                    "selection_strategy": "candidate_artist_track_match",
                     "selected_track": match,
                     "playback": playback,
                 }
