@@ -66,7 +66,16 @@ See `config.example.json` for the full schema. Every setting also supports an en
 - `VESPER_RESOLVER_BASE_URL`
 - `VESPER_RESOLVER_MODEL`
 - `VESPER_RESOLVER_API_KEY`
+- `VESPER_HISTORIAN_ENABLED`
+- `VESPER_HISTORIAN_BASE_URL`
+- `VESPER_HISTORIAN_TOKEN`
 - `VESPER_DATABASE_PATH`
+
+Historian event production is optional and disabled by default. Install
+`historian.manifest.json` with Historian, store the printed token in
+`VESPER_HISTORIAN_TOKEN`, and set `VESPER_HISTORIAN_ENABLED=true`. Historian
+delivery failures are logged but never change a successful music action into a
+failure.
 
 ## Run
 

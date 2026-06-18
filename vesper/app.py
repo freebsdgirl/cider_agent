@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from .config import Settings
+from .historian import build_historian_sink
 from .service import CiderAgentService
 
 
@@ -17,4 +18,5 @@ def get_settings() -> Settings:
 
 @lru_cache(maxsize=1)
 def get_service() -> CiderAgentService:
-    return CiderAgentService(get_settings())
+    settings = get_settings()
+    return CiderAgentService(settings, historian_sink=build_historian_sink(settings))

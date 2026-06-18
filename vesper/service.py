@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from functools import wraps
 import logging
 import json
 import random
@@ -13,6 +14,15 @@ from urllib.parse import quote
 import re
 
 from .config import Settings
+from .historian import (
+    HistorianSink,
+    NullHistorianSink,
+    build_event,
+    current_operation,
+    operation_context,
+    replace_operation,
+    reset_operation,
+)
 from .action_registry import get_action_definition, list_action_definitions, list_public_action_definitions
 from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
 from .results import EngineActionResult, TextRequestResult
@@ -124,6 +134,15 @@ def _clean_id(value: Any) -> str:
     return "" if cleaned.lower() == "none" else cleaned
 
 
+def _historian_operation(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self.operation():
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class CiderAgentService:
     """High-level operations for the Cider agent."""
 
@@ -144,9 +163,14 @@ class CiderAgentService:
         rpc_client: CiderRpcClient | None = None,
         preference_store: PreferenceStore | None = None,
         resolver: Resolver | None = None,
+        historian_sink: HistorianSink | None = None,
     ) -> None:
         self._settings = settings
-        self._rpc = rpc_client or CiderRpcClient(settings)
+        self._historian = historian_sink or NullHistorianSink()
+        self._rpc = rpc_client or CiderRpcClient(settings, failure_callback=self._record_rpc_failure)
+        set_failure_callback = getattr(self._rpc, "set_failure_callback", None)
+        if callable(set_failure_callback):
+            set_failure_callback(self._record_rpc_failure)
         self._preferences = preference_store or PreferenceStore(settings.database_path)
         self._resolver = resolver or build_resolver(settings)
         self._session_worker_thread: threading.Thread | None = None
@@ -173,6 +197,135 @@ class CiderAgentService:
         close = getattr(self._resolver, "close", None)
         if callable(close):
             close()
+        self._historian.close()
+
+    def operation(
+        self,
+        *,
+        caller: str = "direct",
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+        session_id: str | None = None,
+    ):
+        return operation_context(
+            caller=caller,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            session_id=session_id,
+        )
+
+    def _emit(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        source: str,
+        subject: str | None = None,
+        session_id: int | str | None = None,
+    ) -> str:
+        event = build_event(
+            event_type,
+            self._sanitize_event_data(data),
+            source=source,
+            subject=subject,
+            session_id=str(session_id) if session_id is not None else None,
+        )
+        try:
+            self._historian.emit(event)
+        except Exception as exc:
+            LOGGER.warning(
+                "Historian delivery failed for event_id=%s type=%s: %s",
+                event["id"],
+                event_type,
+                exc,
+            )
+        return str(event["id"])
+
+    def _sanitize_event_data(self, value: Any) -> Any:
+        secrets = [
+            secret
+            for secret in (
+                self._settings.cider_api_token,
+                self._settings.resolver_api_key,
+                self._settings.historian_token,
+            )
+            if secret
+        ]
+        if isinstance(value, str):
+            sanitized = value
+            for secret in secrets:
+                sanitized = sanitized.replace(secret, "[REDACTED]")
+            return sanitized
+        if isinstance(value, dict):
+            return {str(key): self._sanitize_event_data(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._sanitize_event_data(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._sanitize_event_data(item) for item in value]
+        return value
+
+    def _caller(self) -> str:
+        context = current_operation()
+        return context.caller if context is not None else "direct"
+
+    def _record_rpc_failure(self, failure: dict[str, Any]) -> None:
+        self._emit(
+            "music.rpc.failed",
+            {
+                "caller": self._caller(),
+                "operation": str(failure.get("operation", "")),
+                "status_code": failure.get("status_code"),
+                "error": str(failure.get("message", "")),
+            },
+            source="app://vesper/rpc",
+        )
+
+    def _record_error(self, component: str, operation: str | None, exc: Exception) -> None:
+        self._emit(
+            "core.operation.error",
+            {
+                "app_id": "vesper",
+                "component": component,
+                "error_type": exc.__class__.__name__,
+                "message": str(exc),
+                "operation": operation,
+                "details": {"caller": self._caller()},
+            },
+            source=f"app://vesper/{component}",
+        )
+
+    def _track_payload(self, track: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(track, dict):
+            return None
+        play_params = track.get("play_params", {}) if isinstance(track.get("play_params"), dict) else {}
+        track_id = (
+            _clean_id(track.get("track_id"))
+            or _clean_id(track.get("id"))
+            or _clean_id(play_params.get("id"))
+        )
+        if not track_id and not any(track.get(key) for key in ("title", "artist", "album")):
+            return None
+        return {
+            "id": track_id or None,
+            "title": track.get("title"),
+            "artist": track.get("artist"),
+            "album": track.get("album"),
+            "kind": track.get("kind") or track.get("type") or play_params.get("kind"),
+            "is_library": track.get("is_library")
+            if track.get("is_library") is not None
+            else play_params.get("is_library"),
+        }
+
+    def _preference_target(self, preference: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(preference, dict):
+            return None
+        return {
+            "track_id": preference.get("track_id"),
+            "title": preference.get("title"),
+            "artist_id": preference.get("artist_id"),
+            "artist_name": preference.get("artist_name"),
+            "album": preference.get("album"),
+        }
 
     def default_search_source(self) -> str:
         return self._settings.default_search_source
@@ -256,6 +409,13 @@ class CiderAgentService:
                 daemon=True,
             )
             self._session_worker_thread.start()
+        with self.operation(caller="startup"):
+            self._emit(
+                "music.worker.started",
+                {"caller": self._caller(), "worker": "adaptive-session"},
+                source="app://vesper/worker",
+                subject="adaptive-session",
+            )
 
     def stop_background_session_worker(self) -> None:
         with self._session_worker_lock:
@@ -264,6 +424,14 @@ class CiderAgentService:
             self._session_worker_thread = None
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
+        if thread is not None:
+            with self.operation(caller="startup"):
+                self._emit(
+                    "music.worker.stopped",
+                    {"caller": self._caller(), "worker": "adaptive-session"},
+                    source="app://vesper/worker",
+                    subject="adaptive-session",
+                )
 
     def status(self) -> dict[str, Any]:
         payload = {
@@ -348,56 +516,114 @@ class CiderAgentService:
     def is_playing(self) -> dict[str, Any]:
         return {"status": "ok", "is_playing": self._extract_is_playing(self._rpc.playback_get("/is-playing"))}
 
+    @_historian_operation
     def play(self) -> dict[str, Any]:
-        session = self._preferences.get_active_session()
-        if session is not None:
-            self._set_session_runtime(session["id"], suspended=False)
-            self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
-            self._preferences.add_session_event(session["id"], event_type="session_resumed")
-            snapshot = self.playback_snapshot()
-            if snapshot.get("is_playing"):
-                return {"status": "ok", "result": self._rpc.playback_post("/play")}
-            if _clean_id(snapshot.get("track", {}).get("track_id")):
-                return {"status": "ok", "result": self._rpc.playback_post("/play")}
-            started_debug_episode = self._begin_resolver_debug_episode("adaptive-session-resume")
-            try:
-                return self._play_session_track(session, selection_strategy="adaptive-session-resume")
-            finally:
-                self._end_resolver_debug_episode(started_debug_episode)
-        return {"status": "ok", "result": self._rpc.playback_post("/play")}
+        with self.operation():
+            session = self._preferences.get_active_session()
+            track = None
+            if session is not None:
+                self._set_session_runtime(session["id"], suspended=False)
+                self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
+                self._preferences.add_session_event(session["id"], event_type="session_resumed")
+                snapshot = self.playback_snapshot()
+                track = self._track_payload(snapshot.get("track"))
+                if snapshot.get("is_playing") or _clean_id(snapshot.get("track", {}).get("track_id")):
+                    result = {"status": "ok", "result": self._rpc.playback_post("/play")}
+                else:
+                    started_debug_episode = self._begin_resolver_debug_episode("adaptive-session-resume")
+                    try:
+                        return self._play_session_track(session, selection_strategy="adaptive-session-resume")
+                    finally:
+                        self._end_resolver_debug_episode(started_debug_episode)
+            else:
+                result = {"status": "ok", "result": self._rpc.playback_post("/play")}
+            self._emit(
+                "music.playback.started",
+                {"caller": self._caller(), "action": "play", "track": track},
+                source="app://vesper/playback",
+            )
+            return result
 
+    @_historian_operation
     def pause(self) -> dict[str, Any]:
-        session = self._preferences.get_active_session()
-        if session is not None:
-            self._set_session_runtime(session["id"], suspended=True)
-            self._persist_session_runtime(session["id"], suspended=True, last_known_playback_state="paused")
-            self._preferences.add_session_event(session["id"], event_type="session_suspended")
-        return {"status": "ok", "result": self._rpc.playback_post("/pause")}
+        with self.operation():
+            session = self._preferences.get_active_session()
+            if session is not None:
+                self._set_session_runtime(session["id"], suspended=True)
+                self._persist_session_runtime(session["id"], suspended=True, last_known_playback_state="paused")
+                self._preferences.add_session_event(session["id"], event_type="session_suspended")
+            result = {"status": "ok", "result": self._rpc.playback_post("/pause")}
+            self._emit(
+                "music.playback.paused",
+                {"caller": self._caller()},
+                source="app://vesper/playback",
+                session_id=session["id"] if session else None,
+            )
+            return result
 
     def playpause(self) -> dict[str, Any]:
         return {"status": "ok", "result": self._rpc.playback_post("/playpause")}
 
+    @_historian_operation
     def stop(self) -> dict[str, Any]:
-        stopped = self._preferences.stop_active_session()
-        if stopped is not None:
-            self._clear_session_runtime(stopped["id"])
-            self._preferences.add_session_event(stopped["id"], event_type="session_stopped")
-        return {"status": "ok", "result": self._rpc.playback_post("/stop")}
-
-    def next_track(self) -> dict[str, Any]:
-        session = self._preferences.get_active_session()
-        if session is not None:
-            self._set_session_runtime(session["id"], suspended=False)
-            self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
-            return self._play_session_track_with_debug_episode(
-                session,
-                selection_strategy="adaptive-session-skip",
-                debug_reason="adaptive-session-skip",
+        with self.operation():
+            stopped = self._preferences.stop_active_session()
+            if stopped is not None:
+                self._clear_session_runtime(stopped["id"])
+                self._preferences.add_session_event(stopped["id"], event_type="session_stopped")
+            result = {"status": "ok", "result": self._rpc.playback_post("/stop")}
+            self._emit(
+                "music.playback.stopped",
+                {"caller": self._caller(), "reason": "stop"},
+                source="app://vesper/playback",
+                session_id=stopped["id"] if stopped else None,
             )
-        return {"status": "ok", "result": self._rpc.playback_post("/next")}
+            if stopped is not None:
+                self._emit(
+                    "music.session.ended",
+                    {
+                        "caller": self._caller(),
+                        "request": stopped["request_text"],
+                        "reason": "playback-stopped",
+                    },
+                    source="app://vesper/session",
+                    subject=str(stopped["id"]),
+                    session_id=stopped["id"],
+                )
+            return result
 
+    @_historian_operation
+    def next_track(self) -> dict[str, Any]:
+        with self.operation():
+            session = self._preferences.get_active_session()
+            if session is not None:
+                self._set_session_runtime(session["id"], suspended=False)
+                self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
+                result = self._play_session_track_with_debug_episode(
+                    session,
+                    selection_strategy="adaptive-session-skip",
+                    debug_reason="adaptive-session-skip",
+                )
+            else:
+                result = {"status": "ok", "result": self._rpc.playback_post("/next")}
+            self._emit(
+                "music.track.skipped",
+                {"caller": self._caller(), "direction": "next"},
+                source="app://vesper/playback",
+                session_id=session["id"] if session else None,
+            )
+            return result
+
+    @_historian_operation
     def previous_track(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/previous")}
+        with self.operation():
+            result = {"status": "ok", "result": self._rpc.playback_post("/previous")}
+            self._emit(
+                "music.track.skipped",
+                {"caller": self._caller(), "direction": "previous"},
+                source="app://vesper/playback",
+            )
+            return result
 
     def get_volume(self) -> dict[str, Any]:
         return {"status": "ok", "volume": self._rpc.playback_get("/volume")}
@@ -473,11 +699,30 @@ class CiderAgentService:
             raise CiderValidationError("url cannot be empty.")
         return {"status": "ok", "result": self._rpc.playback_post("/play-url", {"url": url})}
 
+    @_historian_operation
     def play_item(self, item_id: str, *, kind: str = "songs", is_library: bool = False) -> dict[str, Any]:
         if not item_id.strip():
             raise CiderValidationError("item_id cannot be empty.")
         body = {"id": item_id, "type": kind, "isLibrary": is_library}
-        return {"status": "ok", "result": self._rpc.playback_post("/play-item", body)}
+        result = {"status": "ok", "result": self._rpc.playback_post("/play-item", body)}
+        self._emit(
+            "music.playback.started",
+            {
+                "caller": self._caller(),
+                "action": "play_item",
+                "track": {
+                    "id": item_id,
+                    "title": None,
+                    "artist": None,
+                    "album": None,
+                    "kind": kind,
+                    "is_library": is_library,
+                },
+            },
+            source="app://vesper/playback",
+            subject=item_id,
+        )
+        return result
 
     def play_item_href(self, href: str) -> dict[str, Any]:
         if not href.strip():
@@ -689,12 +934,30 @@ class CiderAgentService:
             "preferences": preferences,
         }
 
+    @_historian_operation
     def forget_preference(self, preference_id: int) -> dict[str, Any]:
+        preference = None
+        try:
+            preference = self._preferences.get_preference(preference_id)
+        except Exception:
+            pass
         removed = self._preferences.delete_preference(preference_id)
         if not removed:
             raise CiderValidationError(f"Preference {preference_id} was not found.")
+        self._emit(
+            "music.preference.forgotten",
+            {
+                "caller": self._caller(),
+                "preference_id": preference_id,
+                "preference_type": preference.get("preference_type") if preference else None,
+                "target": self._preference_target(preference),
+            },
+            source="app://vesper/preferences",
+            subject=str(preference_id),
+        )
         return {"status": "ok", "removed": True, "preference_id": preference_id}
 
+    @_historian_operation
     def like_current_track(self) -> dict[str, Any]:
         playback = self.playback_snapshot()
         current = playback.get("track", {})
@@ -736,6 +999,35 @@ class CiderAgentService:
                     "session_search_query": liked_track.get("session_search_query"),
                 },
             )
+        self._emit(
+            "music.preference.recorded",
+            {
+                "caller": self._caller(),
+                "preference_id": liked_track["id"],
+                "preference_type": liked_track["preference_type"],
+                "polarity": "like",
+                "target": self._preference_target(liked_track),
+                "reason": None,
+            },
+            source="app://vesper/preferences",
+            subject=str(liked_track["id"]),
+            session_id=session["id"] if session else None,
+        )
+        if favored_artist is not None:
+            self._emit(
+                "music.preference.recorded",
+                {
+                    "caller": self._caller(),
+                    "preference_id": favored_artist["id"],
+                    "preference_type": favored_artist["preference_type"],
+                    "polarity": "prefer",
+                    "target": self._preference_target(favored_artist),
+                    "reason": "artist of liked track",
+                },
+                source="app://vesper/preferences",
+                subject=str(favored_artist["id"]),
+                session_id=session["id"] if session else None,
+            )
         return {
             "status": "ok",
             "playback_continues": True,
@@ -775,29 +1067,78 @@ class CiderAgentService:
                 return dict(cached)
         return self.playback_snapshot()
 
+    @_historian_operation
     def stop_session(self) -> dict[str, Any]:
         stopped = self._preferences.stop_active_session()
         if stopped is not None:
             self._clear_session_runtime(stopped["id"])
             self._preferences.add_session_event(stopped["id"], event_type="session_stopped")
+            self._emit(
+                "music.session.ended",
+                {
+                    "caller": self._caller(),
+                    "request": stopped["request_text"],
+                    "reason": "explicit-stop",
+                },
+                source="app://vesper/session",
+                subject=str(stopped["id"]),
+                session_id=stopped["id"],
+            )
         return {"status": "ok", "stopped": stopped is not None, "session": stopped}
 
+    @_historian_operation
     def play_session(self, request: str) -> dict[str, Any]:
         if not request.strip():
             raise CiderValidationError("request cannot be empty.")
+        previous = self._preferences.get_active_session()
         session = self._preferences.start_session(request_text=request.strip())
+        if previous is not None:
+            self._emit(
+                "music.session.ended",
+                {
+                    "caller": self._caller(),
+                    "request": previous["request_text"],
+                    "reason": "replaced",
+                },
+                source="app://vesper/session",
+                subject=str(previous["id"]),
+                session_id=previous["id"],
+            )
         self._clear_all_session_runtime()
         self._set_session_runtime(session["id"], suspended=False, active_search_queries=[], query_pools={})
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="starting")
         self._preferences.add_session_event(session["id"], event_type="session_started", metadata={"request": request.strip()})
+        self._emit(
+            "music.session.started",
+            {
+                "caller": self._caller(),
+                "request": request.strip(),
+                "mode": session["mode"],
+            },
+            source="app://vesper/session",
+            subject=str(session["id"]),
+            session_id=session["id"],
+        )
         try:
             result = self._play_session_track_with_debug_episode(
                 session,
                 selection_strategy="adaptive-session-start",
                 debug_reason=f"adaptive-session-start: {request.strip()}",
             )
-        except Exception:
+        except Exception as exc:
             self._abort_failed_session_start(session["id"])
+            self._emit(
+                "music.session.ended",
+                {
+                    "caller": self._caller(),
+                    "request": request.strip(),
+                    "reason": "startup-failed",
+                },
+                source="app://vesper/session",
+                subject=str(session["id"]),
+                session_id=session["id"],
+            )
+            self._record_error("session", "play_session", exc)
             raise
         return {
             "status": "ok",
@@ -806,6 +1147,7 @@ class CiderAgentService:
             "result": result,
         }
 
+    @_historian_operation
     def steer_session(self, request: str, *, search_update: dict[str, Any] | None = None) -> dict[str, Any]:
         if not request.strip():
             raise CiderValidationError("request cannot be empty.")
@@ -830,6 +1172,18 @@ class CiderAgentService:
             event_type="session_steered",
             metadata={"request": request.strip(), "search_update": resolved_search_update},
         )
+        self._emit(
+            "music.session.steered",
+            {
+                "caller": self._caller(),
+                "request": session["request_text"],
+                "steering": request.strip(),
+                "search_update": resolved_search_update,
+            },
+            source="app://vesper/session",
+            subject=str(session["id"]),
+            session_id=session["id"],
+        )
         playback = self.playback_snapshot()
         result = {
             "status": "ok",
@@ -846,6 +1200,7 @@ class CiderAgentService:
             "result": result,
         }
 
+    @_historian_operation
     def refill_active_session(self) -> dict[str, Any]:
         session = self._preferences.get_active_session()
         if session is None:
@@ -865,19 +1220,33 @@ class CiderAgentService:
             "result": result,
         }
 
+    @_historian_operation
     def reject_current_track(self) -> dict[str, Any]:
         playback = self.playback_snapshot()
         current = playback.get("track", {})
         current_id = _clean_id(current.get("track_id"))
         if not current_id:
             raise CiderValidationError("No current track is available to reject.")
-        self._preferences.record_global_rejected_track(
+        rejected = self._preferences.record_global_rejected_track(
             track_id=current_id,
             title=str(current.get("title", "")).strip() or None,
             artist_name=str(current.get("artist", "")).strip() or None,
             album=str(current.get("album", "")).strip() or None,
             item_kind=str(current.get("kind", "")).strip() or None,
             is_library=bool(current.get("is_library")) if current.get("is_library") is not None else None,
+        )
+        self._emit(
+            "music.preference.recorded",
+            {
+                "caller": self._caller(),
+                "preference_id": rejected["id"],
+                "preference_type": rejected["preference_type"],
+                "polarity": "avoid",
+                "target": self._preference_target(rejected),
+                "reason": "current track rejected",
+            },
+            source="app://vesper/preferences",
+            subject=str(rejected["id"]),
         )
         session = self._preferences.get_active_session()
         if session is None:
@@ -976,6 +1345,23 @@ class CiderAgentService:
         return self._resolver.resolve(text, self)
 
     def execute_text_request(self, text: str) -> TextRequestResult:
+        with self.operation():
+            request_event_id = self._emit(
+                "music.request.received",
+                {
+                    "caller": self._caller(),
+                    "request": text,
+                    "resolved_action": None,
+                },
+                source="app://vesper/request",
+            )
+            operation_token = replace_operation(causation_id=request_event_id)
+            try:
+                return self._execute_text_request(text)
+            finally:
+                reset_operation(operation_token)
+
+    def _execute_text_request(self, text: str) -> TextRequestResult:
         try:
             started_debug_episode = self._begin_resolver_debug_episode(f"text-request: {text.strip()}")
             started_at = time.perf_counter()
@@ -987,6 +1373,7 @@ class CiderAgentService:
             try:
                 execution = self.execute_action(resolved.action, resolved.parameters)
             except CiderAgentError as exc:
+                self._record_error("service", resolved.action, exc)
                 error = {"type": exc.__class__.__name__, "message": str(exc)}
                 timings = None
                 if self.include_timing_debug():
@@ -1027,6 +1414,10 @@ class CiderAgentService:
                 resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
                 timings=timings,
             )
+        except CiderAgentError as exc:
+            if not isinstance(exc, TextRequestExecutionError):
+                self._record_error("resolver", "resolve_text_request", exc)
+            raise
         finally:
             self._end_resolver_debug_episode(locals().get("started_debug_episode", False))
 
@@ -1041,6 +1432,7 @@ class CiderAgentService:
         try:
             result = definition.executor(self, params)
         except (KeyError, TypeError, ValueError) as exc:
+            self._record_error("service", action, exc)
             raise CiderValidationError(f"Invalid parameters for action {action}: {exc}") from exc
         return EngineActionResult(action=action, result=self._finalize_output(result))
 
@@ -1049,22 +1441,25 @@ class CiderAgentService:
 
     def _session_worker_loop(self) -> None:
         while not self._session_worker_stop.wait(self.SESSION_REFILL_INTERVAL_SECONDS):
-            try:
-                session = self._preferences.get_active_session()
-                if session is None:
-                    continue
-                playback = self.playback_snapshot()
-                self._record_current_track_for_session(session, playback=playback)
-                if self._should_advance_session(session, playback):
-                    self._play_session_track_with_debug_episode(
-                        session,
-                        selection_strategy="adaptive-session-auto-advance",
-                        debug_reason="adaptive-session-auto-advance",
-                    )
-            except CiderValidationError as exc:
-                LOGGER.warning("Adaptive session worker could not advance session: %s", exc)
-            except Exception:
-                LOGGER.exception("Adaptive session worker failed during refill loop.")
+            with self.operation(caller="worker"):
+                try:
+                    session = self._preferences.get_active_session()
+                    if session is None:
+                        continue
+                    playback = self.playback_snapshot()
+                    self._record_current_track_for_session(session, playback=playback)
+                    if self._should_advance_session(session, playback):
+                        self._play_session_track_with_debug_episode(
+                            session,
+                            selection_strategy="adaptive-session-auto-advance",
+                            debug_reason="adaptive-session-auto-advance",
+                        )
+                except CiderValidationError as exc:
+                    self._record_error("worker", "adaptive-session-auto-advance", exc)
+                    LOGGER.warning("Adaptive session worker could not advance session: %s", exc)
+                except Exception as exc:
+                    self._record_error("worker", "adaptive-session-refill", exc)
+                    LOGGER.exception("Adaptive session worker failed during refill loop.")
 
     def _play_session_track_with_debug_episode(
         self,
@@ -1120,6 +1515,19 @@ class CiderAgentService:
                 record_selected_started_at = time.perf_counter()
                 self._preferences.add_session_track(session["id"], lead_track)
                 self._record_session_selection_event(session["id"], lead_track, selection_strategy=selection_strategy)
+                self._emit(
+                    "music.session.track_selected",
+                    {
+                        "caller": self._caller(),
+                        "request": session["request_text"],
+                        "selection_strategy": selection_strategy,
+                        "search_query": search_query,
+                        "track": self._track_payload(lead_track),
+                    },
+                    source="app://vesper/session",
+                    subject=_clean_id(lead_track.get("id")) or str(session["id"]),
+                    session_id=session["id"],
+                )
                 timings["record_selected_track_ms"] = _elapsed_ms(record_selected_started_at)
                 touch_started_at = time.perf_counter()
                 self._preferences.touch_session_refill(session["id"])

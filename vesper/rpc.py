@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import httpx
@@ -14,8 +14,14 @@ from .errors import CiderRpcError
 class CiderRpcClient:
     """HTTP client wrapper around Cider's local RPC API."""
 
-    def __init__(self, settings: Settings, session: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        session: httpx.Client | None = None,
+        failure_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self._settings = settings
+        self._failure_callback = failure_callback
         self._session = session or httpx.Client(
             base_url=settings.cider_base_url,
             timeout=settings.request_timeout_seconds,
@@ -24,6 +30,9 @@ class CiderRpcClient:
 
     def close(self) -> None:
         self._session.close()
+
+    def set_failure_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        self._failure_callback = callback
 
     def playback_get(self, path: str) -> Any:
         return self._request("GET", f"/api/v1/playback{path}")
@@ -66,6 +75,7 @@ class CiderRpcClient:
         try:
             response = self._session.request(method, path, headers=headers, json=json_body)
         except httpx.HTTPError as exc:
+            self._report_failure(method, path, None, str(exc))
             raise CiderRpcError(f"Could not reach Cider RPC at {self._settings.cider_base_url}: {exc}") from exc
 
         if response.status_code == 204:
@@ -80,6 +90,7 @@ class CiderRpcClient:
             detail = None
             if isinstance(payload, dict):
                 detail = payload.get("detail") or payload.get("message") or payload.get("error")
+            self._report_failure(method, path, response.status_code, str(detail or "HTTP error"))
             raise CiderRpcError(
                 f"Cider RPC returned HTTP {response.status_code} for {method} {path}.",
                 status_code=response.status_code,
@@ -87,8 +98,20 @@ class CiderRpcClient:
             )
 
         if payload is None:
+            self._report_failure(method, path, response.status_code, "non-JSON response")
             raise CiderRpcError(
                 f"Cider RPC returned a non-JSON response for {method} {path}.",
                 status_code=response.status_code,
             )
         return payload
+
+    def _report_failure(self, method: str, path: str, status_code: int | None, message: str) -> None:
+        if self._failure_callback is None:
+            return
+        self._failure_callback(
+            {
+                "operation": f"{method} {path}",
+                "status_code": status_code,
+                "message": message,
+            }
+        )

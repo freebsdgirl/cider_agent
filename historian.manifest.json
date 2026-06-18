@@ -1,0 +1,332 @@
+{
+  "app_id": "vesper",
+  "description": "Music-control agent for Cider and Apple Music.",
+  "default_scopes": ["events:write"],
+  "schemas": [
+    {
+      "event_type": "music.request.received",
+      "version": 1,
+      "record_family": "event",
+      "description": "A music-control request entered Vesper.",
+      "searchable_fields": ["caller", "request", "resolved_action"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "request": {"type": "string"},
+          "resolved_action": {"type": ["string", "null"]}
+        },
+        "required": ["caller", "request", "resolved_action"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.playback.started",
+      "version": 1,
+      "record_family": "event",
+      "description": "Music playback was started or resumed.",
+      "searchable_fields": ["caller", "action", "track.id", "track.title", "track.artist"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "action": {"type": "string"},
+          "track": {"anyOf": [{"$ref": "#/$defs/track"}, {"type": "null"}]}
+        },
+        "required": ["caller", "action", "track"],
+        "additionalProperties": false,
+        "$defs": {
+          "track": {
+            "type": "object",
+            "properties": {
+              "id": {"type": ["string", "null"]},
+              "title": {"type": ["string", "null"]},
+              "artist": {"type": ["string", "null"]},
+              "album": {"type": ["string", "null"]},
+              "kind": {"type": ["string", "null"]},
+              "is_library": {"type": ["boolean", "null"]}
+            },
+            "required": ["id", "title", "artist", "album", "kind", "is_library"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "event_type": "music.playback.paused",
+      "version": 1,
+      "record_family": "event",
+      "description": "Music playback was paused.",
+      "searchable_fields": ["caller"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"caller": {"type": "string"}},
+        "required": ["caller"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.playback.stopped",
+      "version": 1,
+      "record_family": "event",
+      "description": "Music playback was stopped.",
+      "searchable_fields": ["caller", "reason"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"caller": {"type": "string"}, "reason": {"type": "string"}},
+        "required": ["caller", "reason"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.track.skipped",
+      "version": 1,
+      "record_family": "event",
+      "description": "Playback moved to another track.",
+      "searchable_fields": ["caller", "direction"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "direction": {"type": "string", "enum": ["next", "previous"]}
+        },
+        "required": ["caller", "direction"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.session.started",
+      "version": 1,
+      "record_family": "event",
+      "description": "An adaptive music session started.",
+      "searchable_fields": ["caller", "request", "mode"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "request": {"type": "string"},
+          "mode": {"type": "string"}
+        },
+        "required": ["caller", "request", "mode"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.session.steered",
+      "version": 1,
+      "record_family": "event",
+      "description": "The active adaptive session received new steering.",
+      "searchable_fields": ["caller", "request", "steering", "search_update.mode"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "request": {"type": "string"},
+          "steering": {"type": "string"},
+          "search_update": {
+            "type": "object",
+            "properties": {
+              "mode": {"type": "string", "enum": ["preserve", "add", "replace"]},
+              "queries": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["mode", "queries"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["caller", "request", "steering", "search_update"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.session.track_selected",
+      "version": 1,
+      "record_family": "event",
+      "description": "An adaptive session selected and played a track.",
+      "searchable_fields": ["caller", "request", "selection_strategy", "search_query", "track.id", "track.title", "track.artist"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "request": {"type": "string"},
+          "selection_strategy": {"type": "string"},
+          "search_query": {"type": "string"},
+          "track": {
+            "type": "object",
+            "properties": {
+              "id": {"type": ["string", "null"]},
+              "title": {"type": ["string", "null"]},
+              "artist": {"type": ["string", "null"]},
+              "album": {"type": ["string", "null"]},
+              "kind": {"type": ["string", "null"]},
+              "is_library": {"type": ["boolean", "null"]}
+            },
+            "required": ["id", "title", "artist", "album", "kind", "is_library"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["caller", "request", "selection_strategy", "search_query", "track"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.session.ended",
+      "version": 1,
+      "record_family": "event",
+      "description": "An adaptive music session ended.",
+      "searchable_fields": ["caller", "request", "reason"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "request": {"type": "string"},
+          "reason": {"type": "string"}
+        },
+        "required": ["caller", "request", "reason"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.preference.recorded",
+      "version": 1,
+      "record_family": "app_preference",
+      "description": "Vesper recorded a durable music preference.",
+      "searchable_fields": ["caller", "preference_type", "polarity", "target.track_id", "target.artist_name", "reason"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "preference_id": {"type": "integer"},
+          "preference_type": {"type": "string"},
+          "polarity": {"type": "string", "enum": ["like", "prefer", "avoid"]},
+          "target": {"$ref": "#/$defs/target"},
+          "reason": {"type": ["string", "null"]}
+        },
+        "required": ["caller", "preference_id", "preference_type", "polarity", "target", "reason"],
+        "additionalProperties": false,
+        "$defs": {
+          "target": {
+            "type": "object",
+            "properties": {
+              "track_id": {"type": ["string", "null"]},
+              "title": {"type": ["string", "null"]},
+              "artist_id": {"type": ["string", "null"]},
+              "artist_name": {"type": ["string", "null"]},
+              "album": {"type": ["string", "null"]}
+            },
+            "required": ["track_id", "title", "artist_id", "artist_name", "album"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "event_type": "music.preference.forgotten",
+      "version": 1,
+      "record_family": "app_preference",
+      "description": "Vesper deleted a durable music preference.",
+      "searchable_fields": ["caller", "preference_type", "target.track_id", "target.artist_name"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "preference_id": {"type": "integer"},
+          "preference_type": {"type": ["string", "null"]},
+          "target": {
+            "anyOf": [
+              {"$ref": "#/$defs/target"},
+              {"type": "null"}
+            ]
+          }
+        },
+        "required": ["caller", "preference_id", "preference_type", "target"],
+        "additionalProperties": false,
+        "$defs": {
+          "target": {
+            "type": "object",
+            "properties": {
+              "track_id": {"type": ["string", "null"]},
+              "title": {"type": ["string", "null"]},
+              "artist_id": {"type": ["string", "null"]},
+              "artist_name": {"type": ["string", "null"]},
+              "album": {"type": ["string", "null"]}
+            },
+            "required": ["track_id", "title", "artist_id", "artist_name", "album"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "event_type": "music.rpc.failed",
+      "version": 1,
+      "record_family": "error",
+      "description": "A Cider RPC request failed.",
+      "searchable_fields": ["caller", "operation", "status_code", "error"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string"},
+          "operation": {"type": "string"},
+          "status_code": {"type": ["integer", "null"]},
+          "error": {"type": "string"}
+        },
+        "required": ["caller", "operation", "status_code", "error"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.worker.started",
+      "version": 1,
+      "record_family": "status",
+      "description": "A Vesper background worker started.",
+      "searchable_fields": ["caller", "worker"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"caller": {"type": "string"}, "worker": {"type": "string"}},
+        "required": ["caller", "worker"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "event_type": "music.worker.stopped",
+      "version": 1,
+      "record_family": "status",
+      "description": "A Vesper background worker stopped.",
+      "searchable_fields": ["caller", "worker"],
+      "redacted_fields": [],
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"caller": {"type": "string"}, "worker": {"type": "string"}},
+        "required": ["caller", "worker"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

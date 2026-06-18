@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import sys
 from typing import Any
@@ -73,21 +74,23 @@ def main() -> None:
             return
 
         service = get_service()
-        if args.command == "play":
-            payload = service.play()
-        elif args.command == "pause":
-            payload = service.pause()
-        elif args.command == "stop":
-            payload = service.stop()
-        elif args.command == "ask":
-            payload = service.handle_text_request(args.text)
-        elif args.command == "preferences":
-            if args.preferences_command == "list":
-                payload = service.list_preferences()
-            else:
-                payload = service.forget_preference(args.preference_id)
-        else:  # pragma: no cover - argparse enforces commands
-            raise RuntimeError(f"Unhandled command: {args.command}")
+        operation = getattr(service, "operation", None)
+        with operation(caller="cli") if callable(operation) else nullcontext():
+            if args.command == "play":
+                payload = service.play()
+            elif args.command == "pause":
+                payload = service.pause()
+            elif args.command == "stop":
+                payload = service.stop()
+            elif args.command == "ask":
+                payload = service.handle_text_request(args.text)
+            elif args.command == "preferences":
+                if args.preferences_command == "list":
+                    payload = service.list_preferences()
+                else:
+                    payload = service.forget_preference(args.preference_id)
+            else:  # pragma: no cover - argparse enforces commands
+                raise RuntimeError(f"Unhandled command: {args.command}")
     except TextRequestExecutionError as exc:
         print(json.dumps(exc.payload, indent=2, sort_keys=True), file=sys.stderr)
         raise SystemExit(1) from None

@@ -40,24 +40,34 @@ def create_mcp_server(*, streamable_http_path: str = "/mcp") -> FastMCP:
 
     @server.tool(name="play", description="Resume playback.", structured_output=True)
     def play() -> dict[str, Any]:
-        return get_service().play()
+        service = get_service()
+        with service.operation(caller="mcp"):
+            return service.play()
 
     @server.tool(name="pause", description="Pause playback.", structured_output=True)
     def pause() -> dict[str, Any]:
-        return get_service().pause()
+        service = get_service()
+        with service.operation(caller="mcp"):
+            return service.pause()
 
     @server.tool(name="next", description="Skip to the next track or session-selected track.", structured_output=True)
     def next_track() -> dict[str, Any]:
-        return get_service().next_track()
+        service = get_service()
+        with service.operation(caller="mcp"):
+            return service.next_track()
 
     @server.tool(name="previous", description="Go to the previous track.", structured_output=True)
     def previous_track() -> dict[str, Any]:
-        return get_service().previous_track()
+        service = get_service()
+        with service.operation(caller="mcp"):
+            return service.previous_track()
 
     @server.tool(name="ask", description="Handle a natural-language music request.", structured_output=True)
     def ask(text: str) -> dict[str, Any]:
         if not text.strip():
             raise CiderValidationError("text cannot be empty.")
-        return get_service().handle_text_request(text)
+        service = get_service()
+        with service.operation(caller="mcp"):
+            return service.handle_text_request(text)
 
     return server

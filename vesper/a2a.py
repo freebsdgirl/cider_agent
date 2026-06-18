@@ -193,19 +193,24 @@ def _inspect_message(message: Message) -> RequestInspection:
     raise CiderValidationError("Message did not include a supported text or data part.")
 
 
-def _execute_inspection(inspection: RequestInspection) -> ExecutionResult:
+def _execute_inspection(
+    inspection: RequestInspection,
+    *,
+    correlation_id: str | None = None,
+) -> ExecutionResult:
     service = get_service()
-    if inspection.kind == "text":
-        resolved = service.execute_text_request(inspection.text or "")
-        payload, metadata = render_text_result_for_a2a(resolved)
-        action = resolved.execution.action
-    else:
-        if not inspection.public_action:
-            raise CiderValidationError(
-                f"Structured action '{inspection.action}' is not publicly exposed. Use a plain-language text request instead."
-            )
-        action = inspection.action or ""
-        payload, metadata = render_action_result_for_a2a(service.execute_action(action, inspection.parameters or {}))
+    with service.operation(caller="a2a", correlation_id=correlation_id):
+        if inspection.kind == "text":
+            resolved = service.execute_text_request(inspection.text or "")
+            payload, metadata = render_text_result_for_a2a(resolved)
+            action = resolved.execution.action
+        else:
+            if not inspection.public_action:
+                raise CiderValidationError(
+                    f"Structured action '{inspection.action}' is not publicly exposed. Use a plain-language text request instead."
+                )
+            action = inspection.action or ""
+            payload, metadata = render_action_result_for_a2a(service.execute_action(action, inspection.parameters or {}))
 
     metadata = _metadata_for_action(action, metadata)
     summary = str(metadata.get("summary", "")).strip() or str(payload.get("summary", "")).strip() or f"Completed action '{action}'."
@@ -306,7 +311,7 @@ class CiderAgentExecutor(AgentExecutor):
         )
 
         try:
-            result = _execute_inspection(inspection)
+            result = _execute_inspection(inspection, correlation_id=task_id)
         except TextRequestExecutionError as exc:
             payload = dict(exc.payload)
             agent_message = _agent_message(
