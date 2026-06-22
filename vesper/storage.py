@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import sqlite3
 import json
+import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,10 @@ class PreferenceStore:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        # Serializes session lifecycle mutations (start/stop) so that two
+        # concurrent start_session calls can't interleave their
+        # deactivate-all-then-insert and leave more than one active session.
+        self._lifecycle_lock = threading.Lock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -432,23 +437,24 @@ class PreferenceStore:
         return self._decode_session_row(row) if row is not None else None
 
     def start_session(self, *, request_text: str, mode: str = "adaptive") -> dict[str, Any]:
-        try:
-            with self._connect() as connection:
-                connection.execute("UPDATE sessions SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE is_active = 1")
-                cursor = connection.execute(
-                    """
-                    INSERT INTO sessions(request_text, steering_history_json, mode, is_active)
-                    VALUES (?, '[]', ?, 1)
-                    """,
-                    (request_text, mode),
-                )
-                session_id = int(cursor.lastrowid)
-        except sqlite3.Error as exc:
-            raise PreferenceStoreError(f"Could not start session: {exc}") from exc
-        session = self.get_session(session_id)
-        if session is None:
-            raise PreferenceStoreError(f"Session {session_id} was not found after creation.")
-        return session
+        with self._lifecycle_lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("UPDATE sessions SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE is_active = 1")
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO sessions(request_text, steering_history_json, mode, is_active)
+                        VALUES (?, '[]', ?, 1)
+                        """,
+                        (request_text, mode),
+                    )
+                    session_id = int(cursor.lastrowid)
+            except sqlite3.Error as exc:
+                raise PreferenceStoreError(f"Could not start session: {exc}") from exc
+            session = self.get_session(session_id)
+            if session is None:
+                raise PreferenceStoreError(f"Session {session_id} was not found after creation.")
+            return session
 
     def get_session(self, session_id: int) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -500,24 +506,25 @@ class PreferenceStore:
             raise PreferenceStoreError(f"Could not update session refill timestamp: {exc}") from exc
 
     def stop_active_session(self) -> dict[str, Any] | None:
-        session = self.get_active_session()
-        if session is None:
-            return None
-        try:
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    UPDATE sessions
-                    SET is_active = 0, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (session["id"],),
-                )
-                connection.execute("DELETE FROM session_runtime WHERE session_id = ?", (session["id"],))
-        except sqlite3.Error as exc:
-            raise PreferenceStoreError(f"Could not stop active session: {exc}") from exc
-        session["is_active"] = False
-        return session
+        with self._lifecycle_lock:
+            session = self.get_active_session()
+            if session is None:
+                return None
+            try:
+                with self._connect() as connection:
+                    connection.execute(
+                        """
+                        UPDATE sessions
+                        SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (session["id"],),
+                    )
+                    connection.execute("DELETE FROM session_runtime WHERE session_id = ?", (session["id"],))
+            except sqlite3.Error as exc:
+                raise PreferenceStoreError(f"Could not stop active session: {exc}") from exc
+            session["is_active"] = False
+            return session
 
     def add_session_track(self, session_id: int, track: dict[str, Any]) -> None:
         try:
