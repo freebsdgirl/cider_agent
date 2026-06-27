@@ -39,7 +39,7 @@ from a2a.types import (
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH, PROTOCOL_VERSION_1_0, TransportProtocol
 from a2a.utils.errors import InternalError, InvalidParamsError
 
-from .action_registry import get_action_definition, is_public_action, match_text_action_definition
+from .action_registry import get_action_definition, is_public_action
 from .app import get_service, get_settings
 from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
 from .mcp_server import create_mcp_server
@@ -98,7 +98,6 @@ def _agent_message(
 @dataclass(frozen=True)
 class RequestInspection:
     kind: str
-    read_only: bool
     action: str | None = None
     parameters: dict[str, Any] | None = None
     text: str | None = None
@@ -172,22 +171,18 @@ def _inspect_message(message: Message) -> RequestInspection:
             parameters = {}
         if not isinstance(parameters, dict):
             raise CiderValidationError("parameters must be an object.")
-        definition = get_action_definition(action)
         return RequestInspection(
             kind="action",
             action=action,
             parameters=parameters,
-            read_only=bool(definition and definition.read_only),
             public_action=is_public_action(action),
         )
 
     text = _text_from_message(message)
     if text is not None:
-        definition = match_text_action_definition(text)
         return RequestInspection(
             kind="text",
             text=text,
-            read_only=bool(definition and definition.read_only),
         )
 
     raise CiderValidationError("Message did not include a supported text or data part.")

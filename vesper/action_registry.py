@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import re
 from typing import Any, Callable
 
 from .validation import coerce_volume_param
@@ -28,10 +27,6 @@ class ActionDefinition:
     session_aware: bool = False
     deferred_a2a_eligible: bool = True
     advanced_only: bool = False
-    text_patterns: tuple[str, ...] = ()
-
-    def matches_text(self, text: str) -> bool:
-        return any(re.match(pattern, text, flags=re.IGNORECASE) for pattern in self.text_patterns)
 
 
 def _definition(
@@ -48,7 +43,6 @@ def _definition(
     session_aware: bool = False,
     deferred_a2a_eligible: bool | None = None,
     advanced_only: bool = False,
-    text_patterns: tuple[str, ...] = (),
 ) -> ActionDefinition:
     return ActionDefinition(
         name=name,
@@ -63,7 +57,6 @@ def _definition(
         session_aware=session_aware,
         deferred_a2a_eligible=read_only if deferred_a2a_eligible is None else deferred_a2a_eligible,
         advanced_only=advanced_only,
-        text_patterns=text_patterns,
     )
 
 
@@ -74,7 +67,6 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         "status",
         lambda service, params: service.status(),
         read_only=True,
-        text_patterns=(r"^\s*status\s*$",),
     ),
     _definition(
         "get_now_playing",
@@ -82,12 +74,11 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         "now playing",
         lambda service, params: service.get_now_playing(),
         read_only=True,
-        text_patterns=(r"^\s*what('?s| is)\s+playing\??\s*$", r"^\s*now\s+playing\??\s*$"),
     ),
     _definition("playback_snapshot", "Return a detailed playback snapshot.", "playback snapshot", lambda service, params: service.playback_snapshot(), read_only=True, advanced_only=True),
     _definition("is_playing", "Return whether playback is active.", "is playing", lambda service, params: service.is_playing(), read_only=True, advanced_only=True),
-    _definition("play", "Resume playback.", "play", lambda service, params: service.play(), public_exposed=True, text_patterns=(r"^\s*play\s*$", r"^\s*resume\s*$")),
-    _definition("pause", "Pause playback.", "pause", lambda service, params: service.pause(), public_exposed=True, text_patterns=(r"^\s*pause\s*$",)),
+    _definition("play", "Resume playback.", "play", lambda service, params: service.play(), public_exposed=True),
+    _definition("pause", "Pause playback.", "pause", lambda service, params: service.pause(), public_exposed=True),
     _definition("playpause", "Toggle playback.", "playpause", lambda service, params: service.playpause(), advanced_only=True),
     _definition("stop", "Stop playback and end any active session.", "stop", lambda service, params: service.stop(), public_exposed=True),
     _definition("next_track", "Skip to the next track or session-selected track.", "next track", lambda service, params: service.next_track()),
@@ -106,7 +97,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
     _definition("toggle_shuffle", "Toggle shuffle mode.", "toggle shuffle", lambda service, params: service.toggle_shuffle(), advanced_only=True),
     _definition("get_autoplay", "Get autoplay status.", "autoplay", lambda service, params: service.get_autoplay(), read_only=True, advanced_only=True),
     _definition("toggle_autoplay", "Toggle autoplay.", "toggle autoplay", lambda service, params: service.toggle_autoplay(), advanced_only=True),
-    _definition("get_queue", "Show the playback queue.", "queue", lambda service, params: service.get_queue(), read_only=True, text_patterns=(r"^\s*queue\s+status\??\s*$",)),
+    _definition("get_queue", "Show the playback queue.", "queue", lambda service, params: service.get_queue(), read_only=True),
     _definition("play_next", "Queue an item to play next.", "play next", lambda service, params: service.play_next(dict(params["item"])), required_fields=("item",), advanced_only=True),
     _definition("play_later", "Queue an item to play later.", "play later", lambda service, params: service.play_later(dict(params["item"])), required_fields=("item",), advanced_only=True),
     _definition("move_queue_item", "Move a queue item.", "move queue item", lambda service, params: service.move_queue_item(int(params["from_index"]), int(params["to_index"])), required_fields=("from_index", "to_index"), advanced_only=True),
@@ -119,7 +110,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
     _definition("steer_session", "Steer the active adaptive session.", "steer session", lambda service, params: service.steer_session(str(params["request"]), search_update=dict(params.get("search_update", {})) if isinstance(params.get("search_update"), dict) else None), required_fields=("request",), session_aware=True),
     _definition("like_current_track", "Save the current track, artist, and session cue as a positive music preference.", "like current track", lambda service, params: service.like_current_track(), session_aware=True),
     _definition("reject_current_track", "Reject only the current session track.", "reject current track", lambda service, params: service.reject_current_track(), session_aware=True),
-    _definition("session_status", "Show adaptive session status.", "session status", lambda service, params: service.session_status(), read_only=True, session_aware=True, text_patterns=(r"^\s*session\s+status\??\s*$",)),
+    _definition("session_status", "Show adaptive session status.", "session status", lambda service, params: service.session_status(), read_only=True, session_aware=True),
     _definition("session_queue", "Show Vesper's materialized adaptive-session queue.", "session queue", lambda service, params: service.session_queue(limit=int(params.get("limit", 50)), include_history=bool(params.get("include_history", False))), read_only=True, session_aware=True, advanced_only=True),
     _definition("stop_session", "Stop the active adaptive session.", "stop session", lambda service, params: service.stop_session(), session_aware=True),
     _definition("refill_session", "Manually advance the active adaptive session.", "refill session", lambda service, params: service.refill_active_session(), session_aware=True),
@@ -197,10 +188,3 @@ def is_public_action(action: str) -> bool:
 
 def list_resolver_action_definitions() -> list[ActionDefinition]:
     return [ACTION_REGISTRY[name] for name in RESOLVER_ACTION_NAMES]
-
-
-def match_text_action_definition(text: str) -> ActionDefinition | None:
-    for definition in ACTION_DEFINITIONS:
-        if definition.matches_text(text):
-            return definition
-    return None
