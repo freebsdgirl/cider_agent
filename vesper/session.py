@@ -810,7 +810,10 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
         runtime = self._get_session_runtime(session["id"])
         active_sources = self._normalize_search_sources(runtime.get("active_search_sources"))
         if active_sources and not force_replan:
-            return SessionQueryPlan(search_sources=active_sources[:count] or active_sources, resolver="session-runtime")
+            # Preserve the full multi-source mix on refill / empty-queue rebuild
+            # instead of collapsing to the first active source. ``count`` only
+            # constrains fresh resolver plans, not already-planned runtime state.
+            return SessionQueryPlan(search_sources=active_sources, resolver="session-runtime")
         planner = getattr(self._host._resolver, "plan_session", None)
         if not callable(planner):
             raise CiderValidationError("The configured resolver does not support adaptive play sessions.")

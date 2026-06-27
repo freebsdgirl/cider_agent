@@ -204,7 +204,11 @@ class OpenAICompatibleResolver:
     """Resolve text requests using an OpenAI-compatible chat completions endpoint."""
 
     MAX_COMPLETION_ATTEMPTS = 5
-    MAX_SESSION_SEARCH_QUERIES = 1
+    # Caps how many typed sources a single plan may return. Each source
+    # triggers a real Apple Music catalog lookup, so this bounds per-start
+    # latency and API cost while still supporting multi-source starts like
+    # "play a mix of nirvana, nine inch nails, and portishead".
+    MAX_SESSION_SEARCH_QUERIES = 4
     MAX_SESSION_SELECTION_CANDIDATES = 6
     ACTION_ALIASES = {
         "now_playing": "get_now_playing",

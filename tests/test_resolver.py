@@ -1173,7 +1173,14 @@ def test_session_plan_caps_candidate_lists(settings: Settings, service) -> None:
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "search_queries": ["query one", "query two"],
+                                    "search_sources": [
+                                        {"kind": "vibe", "term": "query one"},
+                                        {"kind": "vibe", "term": "query two"},
+                                        {"kind": "vibe", "term": "query three"},
+                                        {"kind": "vibe", "term": "query four"},
+                                        {"kind": "vibe", "term": "query five"},
+                                        {"kind": "vibe", "term": "query six"},
+                                    ],
                                 }
                             )
                         }
@@ -1187,7 +1194,15 @@ def test_session_plan_caps_candidate_lists(settings: Settings, service) -> None:
 
     plan = resolver.plan_session("play cleaning music", service, {"request_text": "play cleaning music"}, 3)
 
-    assert plan.search_queries == ["query one"]
+    # The multi-source cap (MAX_SESSION_SEARCH_QUERIES) bounds how many typed
+    # sources a single plan may return; six sources are truncated to the cap.
+    assert [source.term for source in plan.search_sources] == [
+        "query one",
+        "query two",
+        "query three",
+        "query four",
+    ]
+    assert len(plan.search_sources) == OpenAICompatibleResolver.MAX_SESSION_SEARCH_QUERIES
 
 
 def test_session_plan_uses_model_query_for_vibes_text(settings: Settings, service) -> None:
