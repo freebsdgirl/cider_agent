@@ -92,10 +92,28 @@ The planner can also return `queue_policy`:
 
 | Policy | Meaning |
 | --- | --- |
-| `source_order` | Keep the materialized queue in the order produced by the source lookup. This is the default. |
-| `shuffle` | Shuffle the concrete queue rows after materialization. |
+| `source_order` | Keep the materialized queue in source order. This is the default. |
+| `shuffle` | Shuffle the combined concrete queue rows after materialization. |
 
-There is no built-in interleave policy today. If multiple sources are materialized together, Vesper either keeps their produced order or shuffles the combined concrete rows.
+When a single plan returns multiple typed sources (for example two `artist`
+sources from a request like "play a mix of nirvana and nine inch nails"),
+Vesper performs the real lookup for each source and combines the per-source
+result sets into one queue by **interleaving**. Interleaving treats each
+source's result set like a deck of cards and weaves the decks together so the
+queue alternates across sources as evenly as possible:
+
+- supports two or more sources;
+- preserves per-source ordering within each source's deck;
+- suppresses duplicate track IDs across the combined result (a track already
+  emitted for an earlier source is skipped in later sources);
+- handles decks of uneven length naturally — once a shorter deck is exhausted,
+  the remaining decks keep contributing;
+- a single source (or none) is returned unchanged, so single-source behavior is
+  identical to before.
+
+Interleaving is the default combination step, not a separate `queue_policy`
+value. `shuffle` is applied *after* interleaving, so `shuffle` reshuffles the
+already-interleaved combined result rather than concatenating-then-shuffling.
 
 ## How the LLM Chooses Search Types
 
@@ -114,19 +132,42 @@ Its planning instruction is constrained:
 - use `genre` only for exact supported genre names;
 - use `vibe` for moods, activities, unsupported subgenres, descriptive requests, and genre-plus-mood requests;
 - use `preference` only as an abstract source for extremely vague requests;
+- return a single source for a single artist, genre, vibe, or preference request;
+- return multiple sources only when the user explicitly asks for a mix of two or
+  more distinct artists, genres, or vibes (for example "play a mix of nirvana
+  and nine inch nails"); list each as its own source entry;
+- return at most `MAX_SESSION_SEARCH_QUERIES` sources (currently 4) — each
+  source triggers a real Apple Music lookup, so this bounds per-start latency;
 - preserve concrete user descriptors instead of unnecessarily narrowing them;
 - use creative interpretation mainly for open-ended/contextual/activity requests;
 - do not invent final tracks.
 
-The session data model can store multiple active typed sources, but the built-in OpenAI-compatible planner currently asks for one source at a time for a new session start or replan. Additional sources can still be added later through steering with `search_update.mode = add`.
-
-The resolver returns only the source. Vesper performs the real Apple Music lookup. If the source is `preference`, Vesper locally builds the pool from saved likes and favored artists without exposing those saved preference rows to the resolver.
+The resolver returns only the source(s). Vesper performs the real Apple Music
+lookup. If the source is `preference`, Vesper locally builds the pool from
+saved likes and favored artists without exposing those saved preference rows to
+the resolver.
 
 The planner does not choose the next track during normal session advances. It chooses a source, and Vesper materializes that source into concrete persisted queue rows. Later advances claim the next eligible row from SQLite.
 
-## Current Multi-Source Behavior
+## Multi-Source Session Behavior
 
-The current implementation supports **additive multi-source steering**, but it does **not** yet support a true multi-source session start in the built-in planner.
+Vesper supports true first-class multi-source session planning. A single plan
+may return multiple typed sources, each is looked up independently, and the
+results are combined into one queue by interleaving.
+
+### Initial multi-artist or multi-source starts
+
+Example:
+
+- `play a mix of nirvana and nine inch nails`
+- `play a mix of nirvana, nine inch nails, and portishead`
+
+When the user explicitly asks for a mix of multiple distinct artists, genres, or
+vibes, the planner may return multiple typed sources in one plan. Vesper fans
+out into a real Apple Music lookup per source and interleaves the per-source
+result sets into one queue before playback starts. So the request triggers two
+(or more) independent artist searches whose results are combined — not a single
+narrowed lookup.
 
 ### Follow-up additive requests
 
@@ -135,25 +176,25 @@ Example:
 1. `play some nirvana`
 2. `add some nine inch nails`
 
-If the follow-up resolves to `steer_session` with `search_update.mode = add`, Vesper keeps the existing session, looks up the new typed source, and appends concrete queue rows for that new source to the persisted session queue.
+If the follow-up resolves to `steer_session` with `search_update.mode = add`,
+Vesper keeps the existing session, looks up the new typed source, and **blends**
+the new source's rows into the remaining queue by interleaving:
 
-What this means in practice:
+- Nine Inch Nails results are added to the same Vesper session queue as the
+  Nirvana results.
+- The new rows are woven through the still-queued rows from existing sources
+  (alternating across sources), not appended after them.
+- Already-played, playing, rejected, or filtered rows are left in history; only
+  `queued` rows are reordered.
+- The current track is not interrupted. The change is usually audible on later
+  tracks.
 
-- Nine Inch Nails results are added to the same Vesper session queue as the Nirvana results.
-- The new rows are appended after the existing queued rows; they are not interleaved into the remaining queue.
-- The current track is not interrupted. The change is usually audible on later tracks.
+### Rebuild and refill
 
-### Initial multi-artist or multi-source starts
-
-Example:
-
-- `play a mix of nirvana and nine inch nails`
-
-This is **not currently a true multi-source session start** in the built-in resolver flow. The session engine can materialize multiple sources into one queue, but the built-in session-start planner currently plans at most one starting source. So this request does not reliably trigger two independent artist searches whose results are combined into one queue before playback starts.
-
-### Rebuild and refill limitation
-
-When a session already has multiple active sources because of additive steering, the existing materialized queue can contain rows from all of them. However, future empty-queue rebuilds and replans currently reuse the first active source from runtime rather than rebuilding a balanced multi-source mix. In other words, additive multi-source sessions are real for the current materialized queue, but that behavior is not yet preserved as a first-class session-start/rebuild strategy.
+When a session already has multiple active sources, future empty-queue rebuilds
+and replans preserve the full multi-source mix instead of collapsing to the
+first active source. The multi-source state is first-class across refill and
+rebuild paths, not just for the current materialized queue.
 
 ## Is the User's Search Used Verbatim?
 
@@ -318,7 +359,7 @@ When steering runs, Vesper:
 
 For a request like `prefer female vocalists`, the resolver may preserve the current source and filter the remaining queue, or it may add/replace sources if it can express the steering as an `artist`, `genre`, or `vibe` source. The exact choice depends on resolver output.
 
-For a request like `add some nine inch nails`, `add` mode appends queue rows for the new source after the currently queued rows. It does not currently weave the two sources together like shuffled decks of cards.
+For a request like `add some nine inch nails`, `add` mode looks up the new source and weaves its rows through the still-queued rows from existing sources by interleaving (alternating across sources as evenly as possible), rather than appending them after the existing queue.
 
 Steering is cumulative. Resolver prompts tell the model to treat steering as persistent session state, not a one-turn hint, until explicitly overridden.
 

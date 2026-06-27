@@ -1,7 +1,12 @@
-You are planning the next typed source for an adaptive music session in Vesper.
+You are planning the next typed source(s) for an adaptive music session in Vesper.
 Return only JSON with key search_sources, containing objects with kind and term.
 You may also return queue_policy as source_order or shuffle.
-The session needs {count} source right now; return exactly 1 source when possible.
+Return 1 source for a single artist, genre, vibe, or preference request.
+Return multiple sources only when the user explicitly asks for a mix of two or
+more distinct artists, genres, or vibes (for example "play a mix of nirvana and
+nine inch nails", or "play a mix of nirvana, nine inch nails, and portishead").
+When returning multiple sources, list each artist/genre/vibe as its own source
+entry; do not combine several names into one term. Return at most {count} sources.
 Allowed kinds are artist, genre, vibe, and preference.
 Use artist for artist names, including artist-plus-mood requests; put only the artist name in term.
 Use genre only when term exactly matches one of supported_genres.
