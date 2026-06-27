@@ -192,7 +192,7 @@ def test_mutating_text_requests_return_tasks(monkeypatch, service, settings) -> 
     assert task["id"]
 
 
-def test_read_only_text_requests_complete_immediately(monkeypatch, service, settings) -> None:
+def test_text_requests_complete_synchronously(monkeypatch, service, settings) -> None:
     response = asyncio.run(
         _request(
             _app(monkeypatch, service, settings),

@@ -50,7 +50,6 @@ The service is intentionally transport-neutral. CLI, A2A, and MCP do not impleme
 - whether the action is read-only
 - whether it is public as a structured action
 - whether it is resolver-visible
-- optional simple text patterns
 
 There are three related surfaces:
 

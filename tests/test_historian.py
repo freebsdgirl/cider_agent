@@ -259,7 +259,6 @@ def test_cli_and_a2a_emit_once_at_service_boundary(
     monkeypatch.setattr(a2a, "get_service", lambda: a2a_service)
     inspection = a2a.RequestInspection(
         kind="action",
-        read_only=False,
         action="pause",
         parameters={},
         public_action=True,
