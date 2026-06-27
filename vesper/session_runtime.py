@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from .service import _clean_id
+from .utils import _clean_id
 
 # Sentinel stored as ``pending_stop_track_id`` when Cider reports playback
 # stopped with no current track at all. Real track ids are numeric, so this

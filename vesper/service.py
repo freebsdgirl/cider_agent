@@ -11,7 +11,6 @@ import random
 import threading
 import time
 from typing import Any
-from urllib.parse import quote
 
 from .config import Settings
 from .historian import (
@@ -78,24 +77,16 @@ from .validation import (
     validate_playlist_id,
     validate_search,
 )
+# Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
+# session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
+# with tests that import it from ``vesper.service``.
+from .utils import _clean_id, _elapsed_ms, _encode_query
+# :class:`vesper.session.SessionEngine` can be imported at module top now that
+# the session modules no longer import from ``vesper.service`` (issue #44).
+from .session import SessionEngine
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _elapsed_ms(start: float) -> float:
-    return round((time.perf_counter() - start) * 1000.0, 2)
-
-
-def _encode_query(query: str) -> str:
-    return quote(query, safe="")
-
-
-def _clean_id(value: Any) -> str:
-    if value is None:
-        return ""
-    cleaned = str(value).strip()
-    return "" if cleaned.lower() == "none" else cleaned
 
 
 def _historian_operation(method):
@@ -144,11 +135,7 @@ class CiderAgentService:
         self._random = random.SystemRandom()
         self._genre_cache: dict[str, dict[str, str]] = {}
         # The adaptive-session engine owns the session runtime, the background
-        # refill worker, and the search/planning/pool machinery. Imported here
-        # (rather than at module top) so vesper.session can import the pure
-        # helpers this module defines without a circular import.
-        from .session import SessionEngine
-
+        # refill worker, and the search/planning/pool machinery.
         self._session = SessionEngine(
             self,
             rpc=self._rpc,
