@@ -30,7 +30,7 @@ from .resolver import (
     SessionTrackSelection,
     _normalize_eligible_indices,
 )
-from .service import _clean_id
+from .utils import _clean_id
 
 
 class SessionQueueMixin:

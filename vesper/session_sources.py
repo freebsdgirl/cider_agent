@@ -21,14 +21,10 @@ import json
 import time
 from typing import Any
 
+from .catalog import flatten_playlist_item as _flatten_playlist_item
+from .matching import normalize_match_text as _normalize_match_text
 from .resolver import SessionSearchSource, SessionTrackSelection
-from .service import (
-    _clean_id,
-    _elapsed_ms,
-    _encode_query,
-    _flatten_playlist_item,
-    _normalize_match_text,
-)
+from .utils import _clean_id, _elapsed_ms, _encode_query
 
 
 class SessionSourcesMixin:

@@ -24,13 +24,10 @@ from typing import Any, Protocol
 from .errors import CiderValidationError
 from .output import compact_output
 from .resolver import SessionQueryPlan, SessionSearchSource
-from .service import (
-    _clean_id,
-    _elapsed_ms,
-)
 from .session_queue import SessionQueueMixin
 from .session_runtime import SessionRuntimeMixin
 from .session_sources import SessionSourcesMixin
+from .utils import _clean_id, _elapsed_ms
 
 LOGGER = logging.getLogger(__name__)
 
