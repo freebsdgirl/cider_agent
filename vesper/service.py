@@ -12,7 +12,6 @@ import threading
 import time
 from typing import Any
 from urllib.parse import quote
-import re
 
 from .config import Settings
 from .historian import (
@@ -25,6 +24,25 @@ from .historian import (
     reset_operation,
 )
 from .action_registry import get_action_definition, list_action_definitions, list_public_action_definitions
+from .catalog import (
+    catalog_relationship_tracks as _catalog_relationship_tracks_impl,
+    catalog_resource_search as _catalog_resource_search_impl,
+    flatten_album_item as _flatten_album_item,
+    flatten_artist_item as _flatten_artist_item,
+    flatten_playlist_item as _flatten_playlist_item,
+    flatten_track_item as _flatten_track_item,
+    get_library_playlist as _get_library_playlist_impl,
+    get_library_playlist_tracks as _get_library_playlist_tracks_impl,
+    list_library_playlists as _list_library_playlists_impl,
+    list_recently_played as _list_recently_played_impl,
+    load_genre_map as _load_genre_map_impl,
+    now_playing_info as _now_playing_info,
+    search_catalog as _search_catalog_impl,
+    search_library as _search_library_impl,
+    search_library_playlists as _search_library_playlists_impl,
+    search_library_tracks as _search_library_tracks_impl,
+    track_attributes as _track_attributes,
+)
 from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
 from .results import EngineActionResult, TextRequestResult
 from .resolver import (
@@ -44,6 +62,16 @@ from .output import (
     finalize_output,
     summarize_execution,
 )
+from .matching import (
+    artist_track_score,
+    best_artist_track_match,
+    best_artist_track_matches,
+    best_playlist_match,
+    best_track_match,
+    normalize_match_text as _normalize_match_text,
+    normalize_title_match_text as _normalize_title_match_text,
+    top_pool_order,
+)
 from .validation import (
     validate_index,
     validate_limit_offset,
@@ -59,125 +87,8 @@ def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000.0, 2)
 
 
-def _track_attributes(item: Any) -> dict[str, Any]:
-    if not isinstance(item, dict):
-        return {}
-    attributes = item.get("attributes")
-    if isinstance(attributes, dict):
-        return attributes
-    if "attributes" in item:
-        return {}
-    return item
-
-
-def _now_playing_info(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-    info = payload.get("info", {})
-    if isinstance(info, list):
-        for item in info:
-            attributes = _track_attributes(item)
-            if attributes:
-                return attributes
-        return {}
-    return _track_attributes(info)
-
-
-def _flatten_track_item(item: Any) -> dict[str, Any]:
-    raw_item = item if isinstance(item, dict) else {}
-    attributes = _track_attributes(item)
-    play_params = attributes.get("playParams", {})
-    artwork = attributes.get("artwork", {})
-    return {
-        "id": raw_item.get("id"),
-        "type": raw_item.get("type"),
-        "href": raw_item.get("href"),
-        "title": attributes.get("name"),
-        "artist": attributes.get("artistName"),
-        "album": attributes.get("albumName"),
-        "duration_millis": attributes.get("durationInMillis"),
-        "isrc": attributes.get("isrc"),
-        "artwork_url": artwork.get("url"),
-        "play_params": {
-            "id": play_params.get("id"),
-            "kind": play_params.get("kind"),
-            "is_library": play_params.get("isLibrary"),
-        },
-        "raw": item,
-    }
-
-
-def _flatten_playlist_item(item: dict[str, Any]) -> dict[str, Any]:
-    attributes = item.get("attributes", {}) if isinstance(item, dict) else {}
-    curator = attributes.get("curatorName")
-    if not curator and isinstance(item.get("relationships"), dict):
-        curator_data = item["relationships"].get("curator", {}).get("data", [])
-        if isinstance(curator_data, list) and curator_data:
-            curator = curator_data[0].get("attributes", {}).get("name")
-    return {
-        "id": item.get("id"),
-        "type": item.get("type"),
-        "href": item.get("href"),
-        "name": attributes.get("name"),
-        "description": attributes.get("description", {}).get("standard")
-        if isinstance(attributes.get("description"), dict)
-        else attributes.get("description"),
-        "can_edit": attributes.get("canEdit"),
-        "is_public": attributes.get("isPublic"),
-        "curator": curator,
-        "playlist_type": attributes.get("playlistType"),
-        "raw": item,
-    }
-
-
-def _flatten_artist_item(item: dict[str, Any]) -> dict[str, Any]:
-    attributes = item.get("attributes", {}) if isinstance(item, dict) else {}
-    return {
-        "id": item.get("id"),
-        "type": item.get("type"),
-        "name": attributes.get("name"),
-        "href": item.get("href"),
-        "raw": item,
-    }
-
-
-def _flatten_album_item(item: dict[str, Any]) -> dict[str, Any]:
-    attributes = item.get("attributes", {}) if isinstance(item, dict) else {}
-    return {
-        "id": item.get("id"),
-        "type": item.get("type"),
-        "name": attributes.get("name"),
-        "artist": attributes.get("artistName"),
-        "track_count": attributes.get("trackCount"),
-        "href": item.get("href"),
-        "raw": item,
-    }
-
-
 def _encode_query(query: str) -> str:
     return quote(query, safe="")
-
-
-def _normalize_match_text(value: str | None) -> str:
-    if value is None:
-        return ""
-    normalized = value.casefold()
-    normalized = normalized.replace("p!nk", "pink")
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    return " ".join(normalized.split())
-
-
-def _normalize_title_match_text(value: str | None) -> str:
-    if value is None:
-        return ""
-    simplified = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", value)
-    simplified = re.sub(
-        r"\s+-\s+(version|ver|movie ver|movie version|instrumental|cover|edit|mix|remaster(?:ed)?)\b.*$",
-        "",
-        simplified,
-        flags=re.IGNORECASE,
-    )
-    return _normalize_match_text(simplified)
 
 
 def _clean_id(value: Any) -> str:
@@ -778,17 +689,7 @@ class CiderAgentService:
         validate_limit_offset(limit, offset)
         if not query.strip():
             raise CiderValidationError("query cannot be empty.")
-        payload = self._rpc.search_catalog(query=query, limit=limit, storefront=storefront, offset=offset)
-        items = payload.get("data", {}).get("results", {}).get("songs", {}).get("data", [])
-        return {
-            "status": "ok",
-            "query": query,
-            "storefront": storefront,
-            "offset": offset,
-            "count": len(items) if isinstance(items, list) else 0,
-            "tracks": [_flatten_track_item(item) for item in items] if isinstance(items, list) else [],
-            "raw": payload,
-        }
+        return _search_catalog_impl(self._rpc, query, limit=limit, storefront=storefront, offset=offset)
 
     def search_catalog_tracks(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
         return self.search_catalog(query, limit=limit, storefront=storefront, offset=offset)
@@ -801,13 +702,7 @@ class CiderAgentService:
         limit: int = 5,
         storefront: str = SESSION_STOREFRONT,
     ) -> list[dict[str, Any]]:
-        path = (
-            f"/v1/catalog/{storefront}/search?term={_encode_query(query)}"
-            f"&types={resource_type}&limit={limit}"
-        )
-        payload = self._rpc.run_amapi_v3(path)
-        items = payload.get("data", {}).get("results", {}).get(resource_type, {}).get("data", [])
-        return list(items) if isinstance(items, list) else []
+        return _catalog_resource_search_impl(self._rpc, query, resource_type=resource_type, limit=limit, storefront=storefront)
 
     def _catalog_relationship_tracks(
         self,
@@ -815,55 +710,12 @@ class CiderAgentService:
         *,
         storefront: str = SESSION_STOREFRONT,
     ) -> list[dict[str, Any]]:
-        tracks: list[dict[str, Any]] = []
-        offset = 0
-        while len(tracks) < self.SESSION_SEARCH_RESULT_LIMIT:
-            limit = min(self.SESSION_SEARCH_PAGE_LIMIT, self.SESSION_SEARCH_RESULT_LIMIT - len(tracks))
-            separator = "&" if "?" in path else "?"
-            page_path = f"/v1/catalog/{storefront}{path}{separator}limit={limit}"
-            if offset:
-                page_path = f"{page_path}&offset={offset}"
-            payload = self._rpc.run_amapi_v3(page_path)
-            data = payload.get("data", {})
-            items = data.get("data", [])
-            if not items:
-                items = data.get("results", {}).get("songs", [{}])[0].get("data", [])
-            if not isinstance(items, list) or not items:
-                break
-            playable = [
-                _flatten_track_item(item)
-                for item in items
-                if isinstance(item, dict)
-                and item.get("type") == "songs"
-                and isinstance(item.get("attributes", {}).get("playParams"), dict)
-            ]
-            tracks.extend(playable)
-            if len(items) < limit:
-                break
-            offset += len(items)
-        return tracks[: self.SESSION_SEARCH_RESULT_LIMIT]
+        return _catalog_relationship_tracks_impl(
+            self._rpc, path, result_limit=self.SESSION_SEARCH_RESULT_LIMIT, page_limit=self.SESSION_SEARCH_PAGE_LIMIT, storefront=storefront
+        )
 
     def _load_genre_map(self, storefront: str = SESSION_STOREFRONT) -> dict[str, str]:
-        if storefront in self._genre_cache:
-            return dict(self._genre_cache[storefront])
-        try:
-            payload = self._rpc.run_amapi_v3(f"/v1/catalog/{storefront}/genres")
-            items = payload.get("data", {}).get("data", [])
-            genre_map = {
-                str(item.get("attributes", {}).get("name", "")).strip(): str(item.get("id", "")).strip()
-                for item in items
-                if isinstance(item, dict)
-                and str(item.get("attributes", {}).get("name", "")).strip()
-                and str(item.get("attributes", {}).get("name", "")).strip() != "Music"
-                and str(item.get("id", "")).strip()
-            }
-            if len(genre_map) > 50:
-                genre_map = {}
-        except Exception as exc:
-            LOGGER.warning("Could not load Apple Music genres for %s: %s", storefront, exc)
-            genre_map = {}
-        self._genre_cache[storefront] = genre_map
-        return dict(genre_map)
+        return _load_genre_map_impl(self._rpc, self._genre_cache, storefront=storefront)
 
     def session_genre_names(self) -> list[str]:
         return list(self._load_genre_map(self.SESSION_STOREFRONT))
@@ -881,96 +733,28 @@ class CiderAgentService:
 
     def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None) -> dict[str, Any]:
         validate_search(query, limit)
-        payload = self._rpc.search_library(query=query, limit=limit, types=types)
-        results = payload.get("data", {}).get("results", {}) if isinstance(payload, dict) else {}
-        tracks = results.get("library-songs", {}).get("data", [])
-        playlists = results.get("library-playlists", {}).get("data", [])
-        albums = results.get("library-albums", {}).get("data", [])
-        artists = results.get("library-artists", {}).get("data", [])
-        return {
-            "status": "ok",
-            "query": query,
-            "types": types or ["library-songs", "library-albums", "library-artists", "library-playlists"],
-            "counts": {
-                "tracks": len(tracks) if isinstance(tracks, list) else 0,
-                "playlists": len(playlists) if isinstance(playlists, list) else 0,
-                "albums": len(albums) if isinstance(albums, list) else 0,
-                "artists": len(artists) if isinstance(artists, list) else 0,
-            },
-            "tracks": [_flatten_track_item(item) for item in tracks] if isinstance(tracks, list) else [],
-            "playlists": [_flatten_playlist_item(item) for item in playlists] if isinstance(playlists, list) else [],
-            "albums": [_flatten_album_item(item) for item in albums] if isinstance(albums, list) else [],
-            "artists": [_flatten_artist_item(item) for item in artists] if isinstance(artists, list) else [],
-            "raw": payload,
-        }
+        return _search_library_impl(self._rpc, query, limit=limit, types=types)
 
     def search_library_tracks(self, query: str, *, limit: int = 10) -> dict[str, Any]:
         validate_search(query, limit)
-        payload = self._rpc.run_amapi_v3(f"/v1/me/library/search?term={_encode_query(query)}&types=library-songs&limit={limit}")
-        items = payload.get("data", {}).get("results", {}).get("library-songs", {}).get("data", [])
-        return {
-            "status": "ok",
-            "query": query,
-            "count": len(items) if isinstance(items, list) else 0,
-            "tracks": [_flatten_track_item(item) for item in items] if isinstance(items, list) else [],
-            "raw": payload,
-        }
+        return _search_library_tracks_impl(self._rpc, query, limit=limit)
 
     def list_library_playlists(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
         validate_limit_offset(limit, offset)
-        path = f"/v1/me/library/playlists?limit={limit}"
-        if offset:
-            path = f"{path}&offset={offset}"
-        payload = self._rpc.run_amapi_v3(path)
-        items = payload.get("data", {}).get("data", [])
-        return {
-            "status": "ok",
-            "count": len(items) if isinstance(items, list) else 0,
-            "next": payload.get("data", {}).get("next") if isinstance(payload, dict) else None,
-            "playlists": [_flatten_playlist_item(item) for item in items] if isinstance(items, list) else [],
-            "raw": payload,
-        }
+        return _list_library_playlists_impl(self._rpc, limit=limit, offset=offset)
 
     def search_library_playlists(self, query: str, *, limit: int = 10) -> dict[str, Any]:
         validate_search(query, limit)
-        payload = self._rpc.run_amapi_v3(
-            f"/v1/me/library/search?term={_encode_query(query)}&types=library-playlists&limit={limit}"
-        )
-        items = payload.get("data", {}).get("results", {}).get("library-playlists", {}).get("data", [])
-        return {
-            "status": "ok",
-            "query": query,
-            "count": len(items) if isinstance(items, list) else 0,
-            "playlists": [_flatten_playlist_item(item) for item in items] if isinstance(items, list) else [],
-            "raw": payload,
-        }
+        return _search_library_playlists_impl(self._rpc, query, limit=limit)
 
     def get_library_playlist(self, playlist_id: str) -> dict[str, Any]:
         validate_playlist_id(playlist_id)
-        payload = self._rpc.run_amapi_v3(f"/v1/me/library/playlists/{playlist_id}")
-        items = payload.get("data", {}).get("data", [])
-        playlist = items[0] if isinstance(items, list) and items else {}
-        return {
-            "status": "ok",
-            "playlist": _flatten_playlist_item(playlist) if isinstance(playlist, dict) else None,
-            "raw": payload,
-        }
+        return _get_library_playlist_impl(self._rpc, playlist_id)
 
     def get_library_playlist_tracks(self, playlist_id: str, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         validate_playlist_id(playlist_id)
         validate_limit_offset(limit, offset)
-        path = f"/v1/me/library/playlists/{playlist_id}/tracks?limit={limit}"
-        if offset:
-            path = f"{path}&offset={offset}"
-        payload = self._rpc.run_amapi_v3(path)
-        items = payload.get("data", {}).get("data", [])
-        return {
-            "status": "ok",
-            "playlist_id": playlist_id,
-            "count": len(items) if isinstance(items, list) else 0,
-            "tracks": [_flatten_track_item(item) for item in items] if isinstance(items, list) else [],
-            "raw": payload,
-        }
+        return _get_library_playlist_tracks_impl(self._rpc, playlist_id, limit=limit, offset=offset)
 
     def play_library_playlist(self, playlist_name: str) -> dict[str, Any]:
         if not playlist_name.strip():
@@ -995,17 +779,7 @@ class CiderAgentService:
 
     def list_recently_played(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
         validate_limit_offset(limit, offset)
-        path = f"/v1/me/recent/played/tracks?limit={limit}"
-        if offset:
-            path = f"{path}&offset={offset}"
-        payload = self._rpc.run_amapi_v3(path)
-        items = payload.get("data", {}).get("data", [])
-        return {
-            "status": "ok",
-            "count": len(items) if isinstance(items, list) else 0,
-            "tracks": [_flatten_track_item(item) for item in items] if isinstance(items, list) else [],
-            "raw": payload,
-        }
+        return _list_recently_played_impl(self._rpc, limit=limit, offset=offset)
 
     def play_search_result(
         self,
@@ -1462,75 +1236,19 @@ class CiderAgentService:
         return None
 
     def _best_track_match(self, tracks: list[dict[str, Any]], *, title: str, artist: str) -> dict[str, Any] | None:
-        title_norm = _normalize_match_text(title)
-        title_base_norm = _normalize_title_match_text(title)
-        artist_norm = _normalize_match_text(artist)
-        for track in tracks:
-            if _normalize_match_text(track.get("title")) == title_norm and _normalize_match_text(track.get("artist")) == artist_norm:
-                return track
-        for track in tracks:
-            track_title = _normalize_match_text(track.get("title"))
-            track_artist = _normalize_match_text(track.get("artist"))
-            if title_norm in track_title and artist_norm == track_artist:
-                return track
-        if title_base_norm:
-            for track in tracks:
-                track_title_base = _normalize_title_match_text(track.get("title"))
-                track_artist = _normalize_match_text(track.get("artist"))
-                if track_artist != artist_norm:
-                    continue
-                if track_title_base == title_base_norm:
-                    return track
-            for track in tracks:
-                track_title_base = _normalize_title_match_text(track.get("title"))
-                track_artist = _normalize_match_text(track.get("artist"))
-                if track_artist != artist_norm:
-                    continue
-                if title_base_norm in track_title_base or track_title_base in title_base_norm:
-                    return track
-        return None
+        return best_track_match(tracks, title=title, artist=artist)
 
     def _best_artist_track_match(self, tracks: list[dict[str, Any]], *, artist: str) -> dict[str, Any] | None:
-        matches = self._best_artist_track_matches(tracks, artist=artist, limit=1)
-        return matches[0] if matches else None
+        return best_artist_track_match(tracks, artist=artist, rng=self._random, pool_size=self.TRACK_SELECTION_POOL_SIZE)
 
     def _best_playlist_match(self, playlists: list[dict[str, Any]], *, playlist_name: str) -> dict[str, Any] | None:
-        target = _normalize_match_text(playlist_name)
-        if not target:
-            return None
-        for playlist in playlists:
-            if _normalize_match_text(playlist.get("name")) == target:
-                return playlist
-        for playlist in playlists:
-            name = _normalize_match_text(playlist.get("name"))
-            if target in name or name in target:
-                return playlist
-        return None
+        return best_playlist_match(playlists, playlist_name=playlist_name)
 
     def _best_artist_track_matches(self, tracks: list[dict[str, Any]], *, artist: str, limit: int) -> list[dict[str, Any]]:
-        artist_norm = _normalize_match_text(artist)
-        exact_artist_tracks = [track for track in tracks if _normalize_match_text(track.get("artist")) == artist_norm]
-        if not exact_artist_tracks:
-            return []
-        scored = sorted(exact_artist_tracks, key=self._artist_track_score, reverse=True)
-        return self._top_pool_order(scored, take=limit)
+        return best_artist_track_matches(tracks, artist=artist, limit=limit, rng=self._random, pool_size=self.TRACK_SELECTION_POOL_SIZE)
 
     def _artist_track_score(self, track: dict[str, Any]) -> tuple[int, int]:
-        album = _normalize_match_text(track.get("album"))
-        title = _normalize_match_text(track.get("title"))
-        album_score = 0
-        if "greatest hits" in album:
-            album_score += 5
-        if "essential" in album:
-            album_score += 4
-        if "so far" in album:
-            album_score += 3
-        if "the truth about love" in album:
-            album_score += 2
-        title_penalty = 0
-        if title == "pink" or title == "pink!":
-            title_penalty -= 3
-        return (album_score, title_penalty)
+        return artist_track_score(track)
 
     def _top_pool_order(
         self,
@@ -1539,13 +1257,7 @@ class CiderAgentService:
         take: int,
         pool_size: int | None = None,
     ) -> list[dict[str, Any]]:
-        if take <= 0 or not tracks:
-            return []
-        bounded_pool = max(1, min(pool_size or self.TRACK_SELECTION_POOL_SIZE, len(tracks)))
-        top_pool = list(tracks[:bounded_pool])
-        self._random.shuffle(top_pool)
-        ordered = top_pool + list(tracks[bounded_pool:])
-        return ordered[:take]
+        return top_pool_order(tracks, take=take, rng=self._random, pool_size=pool_size, default_pool_size=self.TRACK_SELECTION_POOL_SIZE)
 
     def _play_search_result_from_pool(self, *, query: str, source: str, storefront: str) -> dict[str, Any]:
         resolved_source = source.strip().lower()
