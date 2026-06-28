@@ -4,19 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from functools import wraps
-import logging
 import random
 from typing import Any
 
 from .config import Settings
-from .historian import (
-    HistorianDeliveryError,
-    HistorianSink,
-    NullHistorianSink,
-    build_event,
-    current_operation,
-    operation_context,
-)
+from .historian import HistorianSink
 from .results import EngineActionResult, TextRequestResult
 from .resolver import (
     ResolvedAction,
@@ -38,9 +30,7 @@ from .search_controller import SearchController
 from .playback_controller import PlaybackController
 from .text_request_controller import TextRequestController
 from .resolver_debug import ResolverDebugLogger
-
-
-LOGGER = logging.getLogger(__name__)
+from .events import EventEmitter
 
 
 def _historian_operation(method):
@@ -77,7 +67,8 @@ class CiderAgentService:
         historian_sink: HistorianSink | None = None,
     ) -> None:
         self._settings = settings
-        self._historian = historian_sink or NullHistorianSink()
+        self._events = EventEmitter(self, historian_sink)
+        self._historian = self._events.sink
         self._rpc = rpc_client or CiderRpcClient(settings, failure_callback=self._record_rpc_failure)
         set_failure_callback = getattr(self._rpc, "set_failure_callback", None)
         if callable(set_failure_callback):
@@ -135,7 +126,7 @@ class CiderAgentService:
         causation_id: str | None = None,
         session_id: str | None = None,
     ):
-        return operation_context(
+        return self._events.operation(
             caller=caller,
             correlation_id=correlation_id,
             causation_id=causation_id,
@@ -151,80 +142,21 @@ class CiderAgentService:
         subject: str | None = None,
         session_id: int | str | None = None,
     ) -> str:
-        event = build_event(
-            event_type,
-            self._sanitize_event_data(data),
-            source=source,
-            subject=subject,
-            session_id=str(session_id) if session_id is not None else None,
+        return self._events.emit(
+            event_type, data, source=source, subject=subject, session_id=session_id
         )
-        try:
-            self._historian.emit(event)
-        except HistorianDeliveryError as exc:
-            # Historian delivery is best-effort: a failed delivery must never
-            # fail the surrounding operation. Only the documented delivery
-            # failure is swallowed (with a warning); unexpected sink failures
-            # propagate so they remain visible and actionable.
-            LOGGER.warning(
-                "Historian delivery failed for event_id=%s type=%s: %s",
-                event["id"],
-                event_type,
-                exc,
-            )
-        return str(event["id"])
 
     def _sanitize_event_data(self, value: Any) -> Any:
-        secrets = [
-            secret
-            for secret in (
-                self._settings.cider_api_token,
-                self._settings.resolver_api_key,
-                self._settings.historian_token,
-            )
-            if secret
-        ]
-        if isinstance(value, str):
-            sanitized = value
-            for secret in secrets:
-                sanitized = sanitized.replace(secret, "[REDACTED]")
-            return sanitized
-        if isinstance(value, dict):
-            return {str(key): self._sanitize_event_data(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._sanitize_event_data(item) for item in value]
-        if isinstance(value, tuple):
-            return [self._sanitize_event_data(item) for item in value]
-        return value
+        return self._events._sanitize_event_data(value)
 
     def _caller(self) -> str:
-        context = current_operation()
-        return context.caller if context is not None else "direct"
+        return self._events.caller()
 
     def _record_rpc_failure(self, failure: dict[str, Any]) -> None:
-        self._emit(
-            "music.rpc.failed",
-            {
-                "caller": self._caller(),
-                "operation": str(failure.get("operation", "")),
-                "status_code": failure.get("status_code"),
-                "error": str(failure.get("message", "")),
-            },
-            source="app://vesper/rpc",
-        )
+        self._events.record_rpc_failure(failure)
 
     def _record_error(self, component: str, operation: str | None, exc: Exception) -> None:
-        self._emit(
-            "core.operation.error",
-            {
-                "app_id": "vesper",
-                "component": component,
-                "error_type": exc.__class__.__name__,
-                "message": str(exc),
-                "operation": operation,
-                "details": {"caller": self._caller()},
-            },
-            source=f"app://vesper/{component}",
-        )
+        self._events.record_error(component, operation, exc)
 
     def _track_payload(self, track: dict[str, Any] | None) -> dict[str, Any] | None:
         return _track_payload(track)
