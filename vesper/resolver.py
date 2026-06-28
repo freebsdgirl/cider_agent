@@ -777,13 +777,23 @@ class OpenAICompatibleResolver:
         action: str,
         parameters: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
+        """Rewrite ``play_candidate_match`` into a runnable playback action.
+
+        When the resolver returns ``play_candidate_match`` with
+        ``candidate_artists`` but no ``candidate_tracks``, the candidate match
+        cannot be played directly. In that case the action is rewritten to
+        ``play_session`` and every candidate artist is joined into the session
+        request string (comma-separated) so the adaptive session planner can
+        weigh them all. Previously only the first artist survived and the rest
+        were silently discarded.
+        """
         if action != "play_candidate_match":
             return action, parameters
 
         candidate_tracks = parameters.get("candidate_tracks", [])
         candidate_artists = parameters.pop("candidate_artists", [])
         if not candidate_tracks and candidate_artists:
-            return "play_session", {"request": candidate_artists[0]}
+            return "play_session", {"request": ", ".join(candidate_artists)}
         return action, parameters
 
     def _normalize_query_text(self, query: str) -> str:
