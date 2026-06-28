@@ -1002,6 +1002,56 @@ def test_artist_only_candidate_output_becomes_adaptive_session(settings: Setting
     assert resolved.parameters == {"request": "RADWIMPS"}
 
 
+def test_artist_only_candidate_output_joins_multiple_artists(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class MultiArtistTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "play_candidate_match",
+                                    "parameters": {
+                                        "candidate_artists": ["Nirvana", "Nine Inch Nails"],
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=MultiArtistTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("play nirvana and nine inch nails", service)
+
+    assert resolved.action == "play_session"
+    assert resolved.parameters == {"request": "Nirvana, Nine Inch Nails"}
+
+
 def test_candidate_match_singular_query_alias_is_normalized(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
